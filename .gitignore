@@ -1,6 +1,5 @@
-# 构建产物
-build/
-build_w/
+# 构建产物（build / build_gpu / build_w 等所有变体）
+build*/
 out/
 cmake-build-*/
 x64/
@@ -14,6 +13,22 @@ CMakeSettings.json
 .vscode/
 *.user
 *.suo
+
+# MSVC / CMake 中间产物（万一落在仓库根）
+*.obj
+*.exp
+*.ilk
+*.pdb
+*.iobj
+*.ipdb
+*.aps
+*.rcpl
+*.res
+
+# 补丁/备份残留
+*.orig
+*.rej
+*.bak
 
 # 第三方依赖（用 scripts/setup.ps1 重新 clone）
 third_party/

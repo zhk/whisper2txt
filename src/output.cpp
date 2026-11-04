@@ -3,33 +3,39 @@
 
 #include <fstream>
 
-static const char kUtf8Bom[3] = {(char) 0xEF, (char) 0xBB, (char) 0xBF};
+static const char kUtf8Bom[3] = {(char)0xEF, (char)0xBB, (char)0xBF};
 
-bool write_txt(const std::wstring & path, const std::vector<Segment> & segments, std::wstring & err) {
+bool write_txt(const std::wstring &path, const std::vector<Segment> &segments, std::wstring &err)
+{
     const std::string narrow = u8(path);
     std::ofstream f(narrow.c_str(), std::ios::binary | std::ios::trunc);
-    if (!f) {
+    if (!f)
+    {
         err = L"无法写入文件: " + path;
         return false;
     }
 
     f.write(kUtf8Bom, 3);
-    for (const Segment & s : segments) {
-        f.write(s.text.data(), (std::streamsize) s.text.size());
+    for (const Segment &s : segments)
+    {
+        f.write(s.text.data(), (std::streamsize)s.text.size());
         f.write("\r\n", 2);
     }
     f.flush();
-    if (!f) {
+    if (!f)
+    {
         err = L"写入文件失败: " + path;
         return false;
     }
     return true;
 }
 
-bool write_srt(const std::wstring & path, const std::vector<Segment> & segments, std::wstring & err) {
+bool write_srt(const std::wstring &path, const std::vector<Segment> &segments, std::wstring &err)
+{
     const std::string narrow = u8(path);
     std::ofstream f(narrow.c_str(), std::ios::binary | std::ios::trunc);
-    if (!f) {
+    if (!f)
+    {
         err = L"无法写入文件: " + path;
         return false;
     }
@@ -37,7 +43,8 @@ bool write_srt(const std::wstring & path, const std::vector<Segment> & segments,
     f.write(kUtf8Bom, 3);
 
     int index = 1;
-    for (const Segment & s : segments) {
+    for (const Segment &s : segments)
+    {
         std::wstring block;
         block += std::to_wstring(index++);
         block += L"\r\n";
@@ -48,11 +55,12 @@ bool write_srt(const std::wstring & path, const std::vector<Segment> & segments,
         block += wu(s.text);
         block += L"\r\n\r\n";
         const std::string out = u8(block);
-        f.write(out.data(), (std::streamsize) out.size());
+        f.write(out.data(), (std::streamsize)out.size());
     }
 
     f.flush();
-    if (!f) {
+    if (!f)
+    {
         err = L"写入文件失败: " + path;
         return false;
     }

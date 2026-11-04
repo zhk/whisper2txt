@@ -4,7 +4,7 @@
 
 ## 一句话现状
 
-功能已全部可用的阶段：`whisper2txt`（C++17 + 纯 Win32 + whisper.cpp large-v3-turbo，CPU-only）已完成 GUI + CLI + MP3 解码 + 同名 `.txt`/`.srt` 输出 + 模型自动下载续传/镜像回退 + 取消 + 批量 + VAD 加速，并已端到端实测通过；产物在 `dist\`。**尚未 commit 到 git**（`master` 分支 0 commit）。
+功能已全部可用的阶段：`whisper2txt`（C++17 + 纯 Win32 + whisper.cpp large-v3-turbo）已完成 GUI + CLI + MP3 解码 + 同名 `.txt`/`.srt` 输出 + 模型自动下载续传/镜像回退 + 取消 + 批量 + VAD 加速，并已端到端实测通过。**2026-11-04 起改为动态库分发**：`whisper.dll/ggml.dll/ggml-base.dll` + 运行时按需加载的后端 DLL（`ggml-cuda.dll` / `ggml-vulkan.dll` / 9 个 `ggml-cpu-*.dll`），一次构建同时支持 NVIDIA(CUDA 13.4) 与 AMD(Vulkan)，`whisper2txt.exe` 仅 ~750 KB；`use_gpu=true`（无 GPU 自动回落 CPU），CUDA0 实测优先、缺 cuda DLL 自动落 Vulkan0。源码已 commit 到 `main`（dist/ 内 CUDA 后端产物为新改动，未 commit）。
 
 ## 接手必读顺序
 
@@ -16,15 +16,20 @@
 ## 当前工作区状态
 
 ```
-已生成产物：
-  dist\whisper2txt.exe        2,553,344 B   （2026-11-03 构建）
+已生成产物（动态库方案，2026-11-04，build_gpu\）：
+  dist\whisper2txt.exe          769,536 B   （链接 whisper.dll，不再内嵌后端）
+  dist\whisper.dll / ggml.dll / ggml-base.dll
+  dist\ggml-cpu-*.dll         9 个（sse42/sandybridge/haswell/alderlake/icelake/skylakex/cascadelake/cannonlake/x64）
+  dist\ggml-cuda.dll          155,000,832 B（NVIDIA 发行包）
+  dist\ggml-vulkan.dll         42,290,688 B（AMD/通用发行包）
+  dist\cublas64_13.dll + cublasLt64_13.dll（CUDA 运行时，仅 CUDA 包需要，合计 ~548 MB）
   dist\vcomp140.dll           212,920 B     （必须与 exe 同目录）
-  build\                      CMake VS2022 构建目录（可删，重配约 40 s）
+构建目录：build_gpu\（CUDA+Vulkan+共享库）；build\（纯 CPU 静态，若用 -Static）
 模型缓存（不在仓库）：
   %LOCALAPPDATA%\WhisperTxt\models\ggml-large-v3-turbo.bin   1,624,555,275 B
   %LOCALAPPDATA%\WhisperTxt\models\ggml-silero-v6.2.0.bin       885,098 B
-第三方：third_party\whisper.cpp  （git clone --depth 1，已被 .gitignore 忽略）
-测试：test\  （样本 wav/mp3、输出 txt/srt、out_*.log、gui_smoke.ps1）
+第三方：third_party\whisper.cpp  （git clone --depth 1 ggml-org/whisper.cpp，已被 .gitignore 忽略）
+测试：test\  （样本 wav/mp3、输出 txt/srt、out_*.log、gui_smoke.ps1；**wav/mp3 不入库**，新机器用 progress.md 里的 TTS 脚本重建 `zh_test.wav`，`jfk.wav` 可从 `third_party\whisper.cpp\samples\jfk.wav` 复制）
 未清理：build_w\（残留，删除时被占用，可忽略/手动删）
 ```
 
@@ -43,7 +48,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File test\gui_smoke.ps1 `
   -Exe "$PWD\dist\whisper2txt.exe" -Audio "$PWD\test\zh_test.wav"   # 端到端确认
 ```
 
-若新机器有 NVIDIA GPU：可用 `-DGGML_CUDA=1` 重新 configure（`whisper.cpp` 支持），但需要重装/配置 CUDA，且当前代码未暴露 GPU 开关（`use_gpu` 硬编码 false，见 `src/engine.cpp` 的 `load()`）。
+若新机器有 NVIDIA GPU：`powershell scripts\build.ps1 -Gpu`（需 CUDA Toolkit ≥12.8，Blackwell 卡如 RTX 50 系必须 12.8+）；AMD GPU：`-Vk`（需 Vulkan SDK）；两者可同时开，运行期由 ggml 自动选设备。UI 有「使用 GPU 加速」复选框（默认勾选，取消即用 CPU），CLI 对应 `--gpu` / `--cpu`（默认 GPU）。
 
 ## 下一步任务（按优先级）
 
@@ -70,7 +75,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File test\gui_smoke.ps1 `
 
 | 位置 | 内容 |
 |---|---|
-| `src/engine.cpp:168` | `Transcriber::transcribe()`：非 mixed 单调用 / mixed 逐 30 s 窗循环（mixed 分支从 :216 起） |
+| `src/engine.cpp:75` | `Transcriber::load()`：`ggml_backend_load_all()`（必需）+ GPU/CPU 选择（`cparams.use_gpu = cfg_.use_gpu`）+ 设备日志 |
+| `src/engine.cpp` `gpu_device_list()` | 枚举已加载后端里的 GPU 设备名（用于日志与「无 GPU 自动回落」提示） |
+| `src/engine.cpp:204` | `Transcriber::transcribe()`：非 mixed 单调用 / mixed 逐 30 s 窗循环（mixed 分支从 :252 起） |
 | `src/engine.cpp` `emit_segments` | 分段抽取 + 厘秒→ms + `window_base_ms_` 偏移 + 过滤空段/`[BLANK_AUDIO]` |
 | `src/engine.cpp` `physical_core_count()` | CPUID 判超线程 → 默认线程数 |
 | `src/main.cpp` `run_files()` | 与 UI 无关的核心批处理流程（GUI 与 CLI 共用） |
@@ -79,7 +86,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File test\gui_smoke.ps1 `
 | `src/main.cpp` `WM_CREATE` / `wnd_proc` | 控件初始化、`WM_APP_*` 消息处理、关闭时 cancel+join |
 | `src/downloader.cpp` `download_from_url` | Range 续传、416/206/200 分支、15 s 慢速→外层切镜像 |
 | `src/models.cpp` `kModels/kVad/init_urls` | 模型 label/文件名/URL/min_size/expected_size |
-| `src/ui.cpp` `ui_layout` | 控件自适应坐标（改界面先看这里） |
+| `src/ui.cpp` `ui_create` / `ui_layout` | 控件创建（含 id：101-104 按钮 / 201-203 下拉 / 301-304 复选 / 501 列表 / 601 进度 / 701 日志）与坐标自适应；**每个控件都必须在 `ui_layout()` 里 MoveWindow**（改界面先看这里） |
 | `CMakeLists.txt` | 构建选项集中处（OpenMP、静态 CRT、manifest、/utf-8） |
 
 ## 已知环境问题（本机）

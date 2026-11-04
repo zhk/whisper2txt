@@ -9,14 +9,19 @@
 CMakeLists.txt
   └ add_subdirectory(third_party/whisper.cpp)     WHISPER_BUILD_EXAMPLES=OFF
                                                    WHISPER_BUILD_TESTS=OFF
-                                                   BUILD_SHARED_LIBS=OFF  (静态库)
+                                                   WHISPER2TXT_SHARED=ON (默认) →
+                                                     BUILD_SHARED_LIBS=ON, GGML_BACKEND_DL=ON,
+                                                     GGML_NATIVE=OFF, GGML_CPU_ALL_VARIANTS=ON
                                                    GGML_OPENMP=ON         (不可关闭)
-    └ add_executable(whisper2txt WIN32 ...)      链接 whisper, comctl32, comdlg32,
-                                                 shell32, ole32, winhttp
-      CMAKE_MSVC_RUNTIME_LIBRARY = MultiThreaded  → 静态 CRT，不依赖 VCRUNTIME140.dll
-      /utf-8                                      → 源码里的中文字面量正确编译
-      /MANIFEST:EMBED /MANIFESTINPUT:src/app.manifest
+                                                   GGML_CUDA / GGML_VULKAN 由命令行 -D 开关
+     └ add_executable(whisper2txt WIN32 ...)      链接 whisper(import lib), comctl32, comdlg32,
+                                                  shell32, ole32, winhttp
+       CMAKE_MSVC_RUNTIME_LIBRARY = MultiThreaded  → 静态 CRT，不依赖 VCRUNTIME140.dll
+       /utf-8                                      → 源码里的中文字面量正确编译
+       /MANIFEST:EMBED /MANIFESTINPUT:src/app.manifest
 ```
+
+分发（dist\，整体发布）：`whisper2txt.exe` + `whisper.dll` + `ggml.dll` + `ggml-base.dll` + `ggml-cpu-*.dll`×9 + `ggml-cuda.dll`(NVIDIA 包) + `ggml-vulkan.dll`(AMD 包) + `vcomp140.dll`；CUDA 侧另带 `cublas64_13.dll` + `cublasLt64_13.dll`（仅 CUDA 构建需要）。ggml 运行时在 exe 同目录扫描 `ggml-<backend>-*.dll` 自动加载。
 
 依赖闭包（`dumpbin /dependents`）：`COMCTL32 COMDLG32 SHELL32 WINHTTP KERNEL32 USER32 GDI32 ADVAPI32 VCOMP140`。
 前 8 个是系统 DLL；`VCOMP140.DLL` 是唯一非系统依赖 → 已复制到 `dist\`。
@@ -60,7 +65,8 @@ ma_decoder_init_file(utf8_path, &cfg, &decoder);
 
 ## 4. Whisper 调用要点（`src/engine.cpp`）
 
-- `whisper_context_params.use_gpu = false; flash_attn = false;`
+- `whisper_context_params.use_gpu = cfg.use_gpu`（UI「使用 GPU 加速」复选框 / CLI `--gpu`|`--cpu`，默认启用；false 时 whisper 走 CPU 后端）；`flash_attn = false`。
+- 任何 whisper 调用前必须 `ggml_backend_load_all()`（`Transcriber::load()` 内 `std::call_once`），否则共享库+`GGML_BACKEND_DL` 下 registry 里没有任何后端。
 - `whisper_init_state(ctx)` 取得 `whisper_state*` 并缓存，多次转写复用同一模型（加载 ~8.5 s）。
 - `whisper_full_params`：`GREEDY`、`no_timestamps=false`（SRT 需要时间戳）、`print_*` 全 false（走回调）、`suppress_blank=true`、`suppress_nst=true`、`temperature_inc=0.2`。
 - 时间戳单位：`whisper_full_get_segment_t0/t1` 返回 **厘秒**（1/100 s），×10 得 ms。
@@ -99,17 +105,18 @@ WinHTTP 实现（不依赖 curl 外部进程）：
 
 ## 7. GUI（`src/ui.cpp`, `src/main.cpp`）
 
-- 纯 `CreateWindowExW` 控件：ListBox（多选、`LBS_EXTENDEDSEL`）、3 个 ComboBox、3 个 Checkbox、进度条 `msctls_progress32`、只读 multiline Edit 日志。
-- 字体 `Microsoft YaHei UI`，`CLEARTYPE_QUALITY`；`WM_SIZE → ui_layout()` 自适应重排。
+- 纯 `CreateWindowExW` 控件：ListBox（多选、`LBS_EXTENDEDSEL`）、3 个 ComboBox、4 个 Checkbox（同时生成 .srt / 覆盖已有输出 / 启用 VAD 加速 / 使用 GPU 加速）、进度条 `msctls_progress32`、只读 multiline Edit 日志。
+- 字体 `Microsoft YaHei UI`，`CLEARTYPE_QUALITY`；`WM_SIZE → ui_layout()` 自适应重排（三个 `STATIC` 标签 模型/语言/线程 与各自 ComboBox 同列对齐，ComboBox 宽度随窗口收缩，最小宽度 780 下无重叠）。
 - `DragAcceptFiles` + `WM_DROPFILES`（只接受 mp3/wav/flac）；`GetOpenFileNameW` + `OFN_ALLOWMULTISELECT|OFN_EXPLORER`（解析 `dir\0f1\0f2\0\0`）。
 - `IsDialogMessageW` 提供 Tab 导航；`WM_GETMINMAXINFO` 限制最小 780×520。
 - 关闭：`WM_CLOSE/WM_DESTROY` → `stop=true, cancel=true` → 轮询 `running` 最多 30 s → `join()`。
 - CLI/GUI 分流：`CommandLineToArgvW`；有参数 → CLI（`--cli` 可显式）；`--gui 文件...` → GUI 预填文件列表。
+- CLI 选项与 UI 一一对应：`--model` / `--lang` / `--threads` / `--no-srt` / `--vad` / `--overwrite` / `--gpu`（默认）/ `--cpu`。`use_gpu` 参与 transcriber 的 signature（切换会重载模型）。
 - CLI 输出编码：`console_write()` 手写 UTF-8 字节 + `SetConsoleOutputCP(CP_UTF8)`；若 stdout 已重定向到文件则跳过 `AttachConsole`/`freopen("CONOUT$")`，否则日志文件会拿到乱码。
 
 ## 8. 已验证 / 未验证
 
-已验证：MP3 与 WAV 解码、turbo 中文与中英混合准确性、mixed 逐窗检测、VAD 加速与自动下载、断点续传与镜像回退、取消与批量队列、GUI 自动化点击端到端、静态 CRT 无 VC 运行库依赖。
+已验证：MP3 与 WAV 解码、turbo 中文与中英混合准确性、mixed 逐窗检测、VAD 加速与自动下载、断点续传与镜像回退、取消与批量队列、GUI 自动化点击端到端、静态 CRT 无 VC 运行库依赖。GPU：CUDA0（RTX 5070 Ti）46× 实时、Vulkan0 回落（改名掉 ggml-cuda.dll）结果一致、CPU 模式 1.75× 实时；缺 GPU 后端 DLL 时日志提示并自动用 CPU。
 
 未做/待办见 `HANDOFF.md`。
 
@@ -123,3 +130,19 @@ WinHTTP 实现（不依赖 curl 外部进程）：
 6. CMake 4.x 对 whisper.cpp（要求 ≥3.16）可用，configure 约 40 s，首次全量 MSBuild 约 2–4 min。
 7. 若 `whisper2txt.exe` 正在运行，`cmake --build` 会报 `LNK1104 无法打开 exe` → 先杀进程。
 8. UI 自动化测 Win32 Button：`InvokePattern` 不可用，改用 `NativeWindowHandle` + `SendMessageW(BM_CLICK=0x00F5)`（跨进程安全，无指针参数）。
+9. **动态后端模式（当前默认）**：`GGML_BACKEND_DL` 不会自动扫描后端，必须在任何 whisper 调用前显式 `ggml_backend_load_all()`（现于 `Transcriber::load()` 内 `std::call_once`），否则 registry 里 devices=0 直接 `GGML_ASSERT(device)` 崩溃。
+10. `GGML_BACKEND_DL` 与 `GGML_NATIVE=ON` 互斥 → 必须 `-DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON`（产出 9 个 `ggml-cpu-<arch>.dll`，运行时按 CPU 特性选）。
+11. whisper.cpp 把库产物放 `build*/bin/Release/`，exe 在 `build*/Release/`——拷贝 dist 时两个目录都要扫。
+12. MSBuild 的 CUDA targets 靠会话环境变量 `CUDA_PATH_V13_4` 定位工具包；新装的 CUDA 在旧 shell 会话不可见（`CudaToolkitDir '' does not exist`）→ build.ps1 已自动从安装目录设置。缺 cudart_static.lib 同因（构建阶段也要 CUDA_PATH）。
+13. 禁用某后端没有通用环境变量（只有 `GGML_DISABLE_VULKAN`）；测 Vulkan 回落的办法是把 `ggml-cuda.dll` 改名。
+14. UIA 对本程序的 CHECKBOX 不支持 `TogglePattern`（Win32 BUTTON 暴露为 ControlType Button），跨进程 `BM_SETCHECK(0x00F3)` 未改变状态，实测 `BM_CLICK(0x00F5)` 切换有效；读状态用 `BM_GETCHECK(0x00F0)`。日志 Edit 用 `WM_GETTEXT(0x000D)` 跨进程可读（UIA TextPattern 在本机拿不到）。
+15. 共享库模式下 whisper/ggml DLL 落在 `build*/bin/Release/`，exe 在 `build*/Release/`，**直接跑 build 目录里的 exe 会因为找不到 whisper.dll 而失败** → 一律跑 `dist\whisper2txt.exe`（build.ps1 已把两者汇总到 dist）。
+16. `STATIC` 标签没有自动布局：`ui_create` 里创建的 `模型:/语言:/线程:` 若不在 `ui_layout()` 里 `MoveWindow`，会留在初始 `(0,0,10,20)` 压在列表框上（曾如此）。新增控件时务必存 HWND 并在 `ui_layout()` 定位；可用 `EnumChildWindows`+`GetWindowRect`/`ScreenToClient` 脚本核对坐标与重叠（临时脚本，不入库）。
+17. 若有 `dist\whisper2txt.exe` 进程在跑，`build.ps1` 删 dist 会 `Access to the path is denied`（DLL 被占用）→ build.ps1 现在先结束 Path 位于 dist 下的 whisper2txt 进程再删。
+
+## 10. 代码风格
+
+- `src/` 全部使用 **Allman 大括号**（左大括号单独一行），4 空格缩进，制表符不用；根目录 `.clang-format` 是权威配置（`ColumnLimit: 0` 保留既有换行、`SortIncludes: false` 不改包含顺序）。
+- 格式化命令（PATH 上的 `clang-format` 是 6.0.0，太旧会忽略新选项）：
+  `& "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\LLVM\bin\clang-format.exe" -i -style=file src\*.cpp src\*.h`
+- `third_party/whisper.cpp/` 不格式化、不改动。

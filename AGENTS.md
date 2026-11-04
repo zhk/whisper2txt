@@ -6,16 +6,16 @@
 
 1. 读 `HANDOFF.md`（现状 + 禁止事项 + 下一步优先级）。
 2. 读 `techdesign.md` §9「已知坑清单」。
-3. 跑一次最小验证再动手改代码：
+3. 跑一次最小验证再动手改代码（**必须跑 `dist\` 里的 exe**，build 目录里 exe 与 DLL 分离会加载失败）：
    ```powershell
-   powershell scripts\build.ps1
-   build\Release\whisper2txt.exe --cli --lang zh --overwrite test\zh_test.wav
+   powershell scripts\build.ps1 -Gpu -Vk
+   dist\whisper2txt.exe --cli --lang zh --overwrite test\zh_test.wav
    ```
 4. 改代码前先看 `src/engine.cpp` 的 `transcribe()` 与 `src/main.cpp` 的 `run_files()`——核心逻辑集中在这两处。
 
 ## 项目硬约束
 
-- C++17、纯 Win32 GUI、whisper.cpp 静态链接、CPU-only（除非明确要求上 GPU）。
+- C++17、纯 Win32 GUI、whisper.cpp **动态库分发**（`WHISPER2TXT_SHARED=ON`：whisper/ggml DLL + `GGML_BACKEND_DL` 后端模块）、GPU 已启用（CUDA+NVIDIA、Vulkan+AMD，无 GPU 自动回落 CPU）。
 - **不要关闭 `GGML_OPENMP`**（实测关慢 28×）。分发时必须保留 `dist\vcomp140.dll`。
 - 模型 URL 命名空间：模型 `ggerganov/whisper.cpp`，VAD 模型 `ggml-org/whisper-vad`。
 - 不修改 `third_party/whisper.cpp/` 内任何文件；需要变更时改顶层 `CMakeLists.txt` 或 `src/`。
@@ -24,6 +24,7 @@
 
 ## 编码风格
 
+- 大括号一律 **Allman 风格**（左大括号单独一行，函数/控制语句/struct 都是）。用根目录 `.clang-format` 统一格式化：`& "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\LLVM\bin\clang-format.exe" -i -style=file src\*.cpp src\*.h`（注意 PATH 上的 clang-format 是 6.0.0，太旧，用 VS2022 自带的 19.x）。
 - 遵循现有文件划分：`main/ui/engine/audio/output/downloader/models`，不要在 UI 线程做耗时工作。
 - UI 线程与 worker 只通过 `PostMessageW` + `WM_APP_*` 通信，跨线程数据用堆分配结构并在处理后 `delete`。
 - 不加注释，除非用户明确要求或存在非直观的关键约束。

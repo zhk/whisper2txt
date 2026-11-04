@@ -5,9 +5,16 @@
 ## 产物
 
 ```
-dist\whisper2txt.exe     ~2.5 MB   主程序（GUI + CLI 同一 exe）
-dist\vcomp140.dll        ~208 KB   OpenMP 运行时，必须与 exe 同目录
+dist\whisper2txt.exe        ~0.8 MB   主程序（GUI + CLI 同一 exe）
+dist\whisper.dll / ggml.dll / ggml-base.dll                核心库
+dist\ggml-cpu-*.dll          9 个      CPU 后端（按 CPU 指令集自动选）
+dist\ggml-cuda.dll           ~148 MB   NVIDIA GPU 后端（CUDA 发行包才需要）
+dist\ggml-vulkan.dll         ~40 MB    Vulkan 后端（AMD/Intel/通用）
+dist\cublas64_13.dll + cublasLt64_13.dll                   CUDA 运行库（仅 CUDA 发行包需要）
+dist\vcomp140.dll            ~208 KB   OpenMP 运行时，必须与 exe 同目录
 ```
+
+exe 启动时按 exe 同目录里的 `ggml-*.dll` 自动加载后端并选设备（NVIDIA 走 CUDA，AMD 走 Vulkan，都没有就用 CPU）。因此分发时分两种包：**NVIDIA 包**含 `ggml-cuda.dll` + 两个 cublas；**AMD/通用包**含 `ggml-vulkan.dll`（不含 cuda 与 cublas）。
 
 模型缓存（不在仓库内）：
 
@@ -25,7 +32,9 @@ dist\vcomp140.dll        ~208 KB   OpenMP 运行时，必须与 exe 同目录
    - 模型：`large-v3-turbo`（默认）/ `medium` / `large-v3`
    - 语言：`中文 (zh)`（默认）/ `英文 (en)` / `自动检测` / `中英混合 (逐 30 秒窗自动检测)`
    - 线程：默认「自动」= 物理核心数
-   - 勾选：同时生成 `.srt`、启用 VAD 加速、覆盖已有输出
+   - 勾选：同时生成 `.srt`、启用 VAD 加速、覆盖已有输出、**使用 GPU 加速**（默认勾选；取消则纯 CPU）
+
+日志区会显示实际用的计算设备（如 `GPU 加速已启用，可用设备: CUDA0, Vulkan0`；没有可用 GPU 后端时会提示改用 CPU）。
 4. 点「开始转写」→ 进度条 + 日志 → 完成后点「打开输出目录」
 
 模型缺失时点开始会自动下载到上述缓存目录（HuggingFace 直连慢时自动切 `hf-mirror.com`，支持断点续传，src/downloader.cpp:313）。
@@ -40,20 +49,25 @@ dist\whisper2txt.exe --cli test\a.mp3 test\b.mp3
   --vad                         启用 Silero VAD 跳过静音（需下载 VAD 模型）
   --overwrite                   覆盖已存在的输出
   --no-srt                      只写 .txt
+  --gpu / --cpu                 GPU 加速（默认 --gpu）；--cpu 强制纯 CPU 计算
 ```
 
 把 MP3 直接拖到 `whisper2txt.exe` 图标上也会走 CLI 模式（有参数即 CLI，无参数即 GUI）。加 `--gui 文件.mp3` 可预填 GUI 文件列表。
 
 ## 从源码构建
 
-前置：Windows 10/11 x64、Visual Studio 2022（MSVC）、CMake ≥ 3.16、git。
+前置：Windows 10/11 x64、Visual Studio 2022（MSVC）、CMake ≥ 3.16、git。GPU 另需：NVIDIA → CUDA Toolkit ≥ 12.8（RTX 50 系必须 12.8+）；AMD/通用 → Vulkan SDK。
 
 ```powershell
-powershell scripts\setup.ps1     # clone whisper.cpp 到 third_party（若缺失）
-powershell scripts\build.ps1     # configure + build + 拷贝到 dist\
+powershell scripts\setup.ps1              # clone whisper.cpp 到 third_party（若缺失）
+powershell scripts\build.ps1              # 纯 CPU
+powershell scripts\build.ps1 -Gpu -Vk     # CUDA + Vulkan（产物自动汇总到 dist\）
+powershell scripts\build.ps1 -Static      # 退回静态链接（单 exe）
 ```
 
-## 性能与验证结果（本机 Xeon E5-2697 v4 ×2, 36 线程, 96 GB, CPU-only, AVX2）
+## 性能与验证结果
+
+CPU-only（Xeon E5-2697 v4 ×2, 36 线程, 96 GB, AVX2）：
 
 | 样本 | 模型/模式 | 音频时长 | 用时 | 速度 |
 |---|---|---|---|---|
@@ -62,6 +76,15 @@ powershell scripts\build.ps1     # configure + build + 拷贝到 dist\
 | zh_test.wav | turbo, zh | 15 s | 12.3 s | 1.30× 实时 |
 | zh_test.wav | turbo, zh + VAD | 15 s | 10.6 s | 1.51× 实时 |
 | zh_test.wav | turbo, mixed（逐窗检测） | 15 s | 19.8 s | 0.81× 实时 |
+
+GPU（RTX 5070 Ti 16 GB + CUDA 13.4）：
+
+| 样本 | 模型/模式 | 音频时长 | 用时 | 速度 |
+|---|---|---|---|---|
+| zh_test.wav | turbo, zh + GPU(CUDA) | 15 s | 0.3 s | 46.5× 实时 |
+| zh_test.wav | turbo, zh + VAD + GPU | 15 s | 0.3 s | 49.4× 实时 |
+| zh_test.wav | turbo, zh + GPU(Vulkan，无 CUDA DLL) | 15 s | — | 结果与 CUDA 一致 |
+| zh_test.wav | turbo, zh，取消 GPU 勾选（CPU） | 15 s | 9.1 s | 1.75× 实时 |
 
 模型加载约 8.4–8.8 s（一次性，批量转写复用同一实例）。
 

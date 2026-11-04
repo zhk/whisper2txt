@@ -1,0 +1,17 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+ContinuationIndentWidth: 4
+BreakBeforeBraces: Allman
+AccessModifierOffset: -4
+ColumnLimit: 0
+SortIncludes: false
+AlignAfterOpenBracket: DontAlign
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortCaseLabelsOnASingleLine: false
+PointerAlignment: Right
+ReferenceAlignment: Right
+SpaceBeforeParens: ControlStatements
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1

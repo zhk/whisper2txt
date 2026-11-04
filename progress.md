@@ -1,7 +1,7 @@
 # 项目进度 (progress.md)
 
 项目：`whisper2txt` — Windows 本地 MP3 → TXT/SRT 图形工具（whisper.cpp 方案）。
-仓库：`E:\ProjectsMine\_gitHub_Debian9\Whisper`（分支 `master`，**尚无 commit**，全部为未跟踪文件）。
+仓库：`D:\DiskE\_github\whisper2txt`（分支 `main`，已 push 到 origin；**2026-11-04 的「动态库分发 + GPU 开关」改动尚未 commit**；`third_party/`、`build*/`、`dist/` 不入库）。
 最后更新：2026-11-03。
 
 ## 状态总览
@@ -45,6 +45,19 @@
 | 7 | GUI 自动化点击（`test/gui_smoke.ps1`） | 默认 GUI 选项 | 15 s | 输出文件 20 s 内出现 | — | 通过 |
 | — | 模型加载（首次） | turbo | — | 8.4–8.8 s | — | 批量复用同一实例 |
 
+### GPU 化后实测（2026-11-04，新机器：RTX 5070 Ti 16 GB + CUDA 13.4 + Vulkan SDK 1.4.363）
+
+| # | 样本 | 模式 | 音频 | 用时 | 速度 | 结果 |
+|---|---|---|---|---|---|---|
+| 8 | `test/zh_test.wav` | turbo + zh + **GPU(CUDA)** | 15 s | 0.3 s | 46.5× | 2 段，内容正确 |
+| 9 | 同上 | turbo + zh + VAD + GPU | 15 s | 0.3 s | 49.4× | 同上 |
+| 10 | 同上 | turbo + zh + **CPU**（取消勾选 / `--cpu`） | 15 s | 9.1 s | 1.75× | 与 GPU 结果一致 |
+| 11 | 同上 | turbo + zh，GPU 勾选但删掉 `ggml-cuda.dll`+`ggml-vulkan.dll` | 15 s | — | CPU | 日志提示后自动回落 CPU，不崩 |
+| 12 | 同上 | turbo + zh，改名掉 `ggml-cuda.dll` | 15 s | — | — | 自动选 `Vulkan0`，内容一致 |
+| — | 模型加载 | GPU / CPU | — | 6.4 s / ~7 s | — | — |
+
+界面复选框「使用 GPU 加速」（id 304，默认勾选）已验证：GUI 自动化取消勾选后走 CPU（11–14 s 出结果），勾选时 3 s 出结果；日志区显示所用设备。
+
 `zh_test.wav` 转写结果（准确性证据）：
 
 ```
@@ -72,13 +85,14 @@
 ## 快速复现验证
 
 ```powershell
-powershell scripts\build.ps1
-build\Release\whisper2txt.exe --cli --lang zh --overwrite test\zh_test.wav
-build\Release\whisper2txt.exe --cli --lang mixed --overwrite test\zh_test.wav
-build\Release\whisper2txt.exe --cli --vad --overwrite test\zh_test.wav
+powershell scripts\build.ps1 -Gpu -Vk      # 动态库 + CUDA + Vulkan（产物已自动汇总到 dist\）
+dist\whisper2txt.exe --cli --lang zh --overwrite test\zh_test.wav
+dist\whisper2txt.exe --cli --lang mixed --overwrite test\zh_test.wav
+dist\whisper2txt.exe --cli --vad --overwrite test\zh_test.wav
+dist\whisper2txt.exe --cli --cpu --overwrite test\zh_test.wav   # 强制 CPU
 powershell -NoProfile -ExecutionPolicy Bypass -File test\gui_smoke.ps1 `
-  -Exe "E:\ProjectsMine\_gitHub_Debian9\Whisper\dist\whisper2txt.exe" `
-  -Audio "E:\ProjectsMine\_gitHub_Debian9\Whisper\test\zh_test.wav"
+  -Exe "$PWD\dist\whisper2txt.exe" `
+  -Audio "$PWD\test\zh_test.wav"
 ```
 
 生成新的中文测试音频（需要系统带 zh-CN TTS，本机有 `Microsoft Huihui Desktop`）：

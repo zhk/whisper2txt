@@ -7,8 +7,15 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP ON CACHE BOOL "" FORCE)
+
+option(WHISPER2TXT_SHARED "build whisper/ggml as DLLs with dynamically loaded backends" ON)
+if(WHISPER2TXT_SHARED)
+    set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+    set(GGML_BACKEND_DL ON CACHE BOOL "" FORCE)
+else()
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+endif()
 
 add_subdirectory(third_party/whisper.cpp)
 
