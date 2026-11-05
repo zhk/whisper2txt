@@ -72,6 +72,7 @@ struct Settings
     int highpass_hz = 100;
     float vad_threshold = -1.0f;
     int vad_pad_ms = -1;
+    float no_speech_thold = -100.0f;
     std::string terms_prompt;
     std::vector<std::pair<std::string, std::string>> terms_repl;
     std::vector<std::wstring> files;
@@ -168,7 +169,8 @@ static bool ensure_transcriber_ctx(JobContext &ctx, Settings &st, std::wstring &
                                   std::to_string(st.threads) + "|" + std::to_string(st.vad ? 1 : 0) + "|" +
                                   std::to_string(st.use_gpu ? 1 : 0) + "|" + std::to_string(st.quality) + "|" +
                                   std::to_string(prompt_h) + "|" + std::to_string(st.terms_repl.size()) + "|" +
-                                  std::to_string((int)(st.vad_threshold * 100.0f)) + "|" + std::to_string(st.vad_pad_ms);
+                                  std::to_string((int)(st.vad_threshold * 100.0f)) + "|" + std::to_string(st.vad_pad_ms) +
+                                  "|" + std::to_string((int)(st.no_speech_thold * 100.0f));
 
     if (*ctx.transcriber != nullptr && *ctx.signature == signature)
     {
@@ -188,6 +190,7 @@ static bool ensure_transcriber_ctx(JobContext &ctx, Settings &st, std::wstring &
     cfg.terms = st.terms_repl;
     cfg.vad_tuning.threshold = st.vad_threshold;
     cfg.vad_tuning.speech_pad_ms = st.vad_pad_ms;
+    cfg.no_speech_thold = st.no_speech_thold;
     if (st.quality == 1 && st.model_slot == SLOT_TURBO)
     {
         ctx.log(L"提示: 高精度模式下建议改用 large-v3 模型 (对口音与音质的鲁棒性更好)");
@@ -1120,6 +1123,12 @@ static int run_cli_mode()
             st.vad_pad_ms = _wtoi(argv[i]);
             continue;
         }
+        if (a == L"--no-speech-thold" && i + 1 < argc)
+        {
+            ++i;
+            st.no_speech_thold = (float)_wtof(argv[i]);
+            continue;
+        }
         if (!a.empty() && a[0] == L'-')
         {
             console_write(L"未知选项: " + a + L"\n");
@@ -1138,6 +1147,7 @@ static int run_cli_mode()
         console_write(L"  --no-preproc                 关闭音频预处理 (默认: 取较响声道 + 峰值归一化 + 100Hz 高通)\n");
         console_write(L"  --highpass N                 高通截止 Hz (默认 100, 0 = 关闭)\n");
         console_write(L"  --vad-threshold F --vad-pad N  VAD 阈值/前后填充 (默认由质量模式决定)\n");
+        console_write(L"  --no-speech-thold F          静音判定概率阈值 (默认 0.6; 调低更容易把低置信窗判为静音而丢弃)\n");
         console_write(L"  --threads N   --no-srt   --vad   --overwrite   --gpu (默认) | --cpu\n");
         console_write(L"输出: 与输入同目录同名的 .txt (和 .srt)\n");
         return 2;

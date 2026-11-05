@@ -76,11 +76,11 @@ ma_decoder_get_data_format(&decoder, &fmt, &channels, &rate, nullptr, 0); // 解
 - `whisper_init_state(ctx)` 取得 `whisper_state*` 并缓存，多次转写复用同一模型（加载 ~8.5 s）。
 - `whisper_full_params`（两档预设，`EngineConfig::quality`）：
   - **fast**（默认）：`WHISPER_SAMPLING_GREEDY` + `greedy.best_of=1`、`temperature_inc=0.2`，其余用库默认。
-  - **high**：`WHISPER_SAMPLING_BEAM_SEARCH` + `beam_search.beam_size=5`、`temperature_inc=0.4`、`entropy_thold=1.5`、`logprob_thold=−1.2`、`no_speech_thold=−0.6`；VAD 同时调成 `threshold 0.35 / speech_pad_ms 150 / min_silence_duration_ms 300 / max_speech_duration_s 40`。
+  - **high**：`WHISPER_SAMPLING_BEAM_SEARCH` + `beam_search.beam_size=5`、`temperature_inc=0.4`、`entropy_thold=1.5`、`logprob_thold=−1.2`；VAD 同时调成 `threshold 0.35 / speech_pad_ms 150 / min_silence_duration_ms 300 / max_speech_duration_s 40`。`no_speech_thold` **不改**（保持 0.6，语义见 §9 #22），需要时用 `EngineConfig::no_speech_thold`（CLI `--no-speech-thold`）覆盖。
   - 共同：`no_timestamps=false`（SRT 要时间戳）、`print_*` 全 false（走回调）、`suppress_blank=true`、`suppress_nst=true`、`no_context=false`（同一次调用内保留上文）。
   - 注意本版本 whisper.cpp 的默认值是 `no_context=true`、`no_speech_thold=0.6`、`greedy.best_of=5`、`beam_search.beam_size=-1` —— 改参数前先看 `whisper_full_default_params()`，别按旧文档写死。
 - `params.initial_prompt`：术语表拼接（≤420 B）。实测会同时影响**大小写**（`Review`→`review`）、**标点密度**（逗号变多）和**分段粒度**，所以调完必须重新 A/B。
-- `params.vad_params`：由质量预设填默认，再被 `VadTuning` 覆盖（CLI `--vad-threshold` / `--vad-pad`；`-1` 表示不覆盖）。
+- **VAD 由本项目自己实现**（`Transcriber::make_vad_params()` + `Transcriber::vad_chunks()`，`src/engine.cpp`）：**whisper 的 `params.vad` 只在 `whisper_full()` 里生效，`whisper_full_with_state()` 完全忽略它**，而本项目所有调用都是 `with_state` → 设 `params.vad` 是死代码。正确做法：`whisper_vad_init_from_file_with_params()`（`load()` 里建一次并缓存 `vctx_`）→ `whisper_vad_segments_from_samples()` 取语音段（**t0/t1 单位是厘秒**，×10 得 ms）→ 合并成 ≤28 s 的块（相邻间隔 ≤1 s 才合并）→ 逐块 `whisper_full_with_state`，`window_base_ms_ = 块起始 ms`，时间戳因此留在原始轴上（不像上游 VAD 那样把静音压掉后时间漂移）。**覆盖度启发式**：语音占比 ≥85% 时**不切窗**，整段一次识别（连续录音切窗会丢上下文，实测错误率 3.27% → 4.58%）；占比 0 → 直接空输出（静音不再被幻觉成文字）。VAD 参数来自质量预设 + `VadTuning`（CLI `--vad-threshold` / `--vad-pad`，`-1`=不覆盖）。
 - 后处理（`transcribe()` 末尾）：`dedupe_segments()`（归一化文本后：完全相同 → 合并时间；时间重叠 >300 ms 且互为前缀 → 取更长者）→ `apply_terms()`（`术语表` 里 `错=>对` 的替换，英文按单词边界、大小写无关，非 ASCII 按字节子串）。
 - 时间戳单位：`whisper_full_get_segment_t0/t1` 返回 **厘秒**（1/100 s），×10 得 ms。
 
@@ -126,15 +126,15 @@ WinHTTP 实现（不依赖 curl 外部进程）：
 - `IsDialogMessageW` 提供 Tab 导航；`WM_GETMINMAXINFO` 限制最小 **880×520**（4 个下拉 + 2 排复选框需要这个宽度才不重叠）。
 - 关闭：`WM_CLOSE/WM_DESTROY` → `stop=true, cancel=true` → 轮询 `running` 最多 30 s → `join()`。
 - CLI/GUI 分流：`CommandLineToArgvW`；有参数 → CLI（`--cli` 可显式）；`--gui 文件...` → GUI 预填文件列表。
-- CLI 选项与 UI 一一对应：`--model` / `--lang` / `--threads` / `--no-srt` / `--vad` / `--overwrite` / `--gpu`（默认）/ `--cpu` / `--quality fast|high` / `--terms 文件` / `--no-preproc` / `--highpass N` / `--vad-threshold F` / `--vad-pad N`。transcriber signature 含 `model|lang|threads|vad|use_gpu|quality|promptHash|termsCount|vadThreshold|vadPad`（切换这些会重载模型；预处理只影响音频，不参与 signature）。
+- CLI 选项与 UI 一一对应：`--model` / `--lang` / `--threads` / `--no-srt` / `--vad` / `--overwrite` / `--gpu`（默认）/ `--cpu` / `--quality fast|high` / `--terms 文件` / `--no-preproc` / `--highpass N` / `--vad-threshold F` / `--vad-pad N` / `--no-speech-thold F`。transcriber signature 含 `model|lang|threads|vad|use_gpu|quality|promptHash|termsCount|vadThreshold|vadPad|noSpeechThold`（切换这些会重载模型；预处理只影响音频，不参与 signature）。
 - 术语表解析：`load_terms_file()`（`src/main.cpp:418`）读 UTF-8（跳 BOM），`#`/`;` 注释，`A=>B` → 后处理替换，其余行拼 `initial_prompt`（≤420 B）；结果存 `App::terms_prompt / terms_repl`，按钮文案回显文件名。
 - CLI 输出编码：`console_write()` 手写 UTF-8 字节 + `SetConsoleOutputCP(CP_UTF8)`；若 stdout 已重定向到文件则跳过 `AttachConsole`/`freopen("CONOUT$")`，否则日志文件会拿到乱码。
 
 ## 8. 已验证 / 未验证
 
-已验证：MP3 与 WAV 解码、turbo 中文与中英混合准确性、mixed 逐窗检测、VAD 加速与自动下载、断点续传与镜像回退、取消与批量队列、GUI 自动化点击端到端、静态 CRT 无 VC 运行库依赖。GPU：CUDA0（RTX 5070 Ti）46× 实时、Vulkan0 回落（改名掉 ggml-cuda.dll）结果一致、CPU 模式 1.75× 实时；缺 GPU 后端 DLL 时日志提示并自动用 CPU。
+已验证：MP3 与 WAV 解码、turbo 中文与中英混合准确性、mixed 逐窗检测、断点续传与镜像回退、取消与批量队列、GUI 自动化点击端到端、静态 CRT 无 VC 运行库依赖。GPU：CUDA0（RTX 5070 Ti）46× 实时、Vulkan0 回落（改名掉 ggml-cuda.dll）结果一致、CPU 模式 1.75× 实时；缺 GPU 后端 DLL 时日志提示并自动用 CPU。（注：2026-11-04 之前的「VAD 已验证」是**假验证**——`params.vad` 在 `with_state` 下无效，见 §9 #23；现在自实现后重新验证。）
 
-识别率相关（2026-11-04 新增，均已实测）：音频预处理（声道选择 + 100 Hz 高通 + 峰值归一化）与日志统计；`--quality high`（beam5 + 阈值/ VAD 调参）在 GPU 上 38–47× 实时仍远超实时；术语表 `initial_prompt` 与 `错=>对` 后处理替换均生效（`购语言`→`Go 语言`、`CodeReview`→`Code Review`、`Prototype=>原型`）；mixed 改 28/30 重叠窗后 45 s 样本无重复段、结尾不漏；`flash_attn=true`（GPU）后 fast 档 58.8× 实时；`scripts\ab_quality.ps1` + `tools\wer.py` 出错误率（45 s 样本：fast/high/high+VAD 3.27% → 加术语表 **1.31%**）。
+识别率相关（2026-11-04 新增，均已实测）：音频预处理（声道选择 + 100 Hz 高通 + 峰值归一化，实测会改分段与书写：6→13 段、`三点`→`3点`）；`--quality high`（beam5 + 阈值/VAD 调参）38–47× 实时；术语表 `initial_prompt` 与 `错=>对` 替换生效（`购语言`→`Go 语言`、`CodeReview`→`Code Review`、`Prototype=>原型`）；mixed 28/30 重叠窗 45 s 样本无重复、结尾不漏；`flash_attn` 后 fast 档 58.8×；**VAD 自实现后**：30 s 纯静音输出从 1 段幻觉（`中文字幕志愿者 杨栋梁`）变成 **0 行**；20 s 静音+45 s 语音+15 s 静音的样本 → VAD 覆盖 55% → 切 2 块、只送 44 s、SRT 首段 `00:00:19,980`（时间轴不漂）、错误率不变；覆盖度 ≥85% 自动走整段识别（切窗会让 3.27%→4.58%，故加此启发式）；**换 large-v3**（已缓存 3.09 GB）在人为衰减 28 dB 的“差录音”样本上 3.27%→2.61%，叠加术语表到 **0.65%**，GPU 上仍 11.9× 实时。A/B 工具（`scripts\ab_quality.ps1` + `tools\wer.py`）：45 s 样本 fast/high/high+VAD 3.27% → +术语表 **1.31%**。
 
 未做/待办见 `HANDOFF.md`。
 
@@ -161,6 +161,8 @@ WinHTTP 实现（不依赖 curl 外部进程）：
 19. **`initial_prompt` 不只是“加词”**：它会改标点密度、大小写与分段粒度（实测 `Review`→`review`、逗号变多、段更少更长）。术语表换一版就得重跑 A/B。
 20. **PowerShell 5.1 按 ANSI 读 .ps1**：脚本里写中文字面量会解析报 `Missing type name after '['` 之类乱码错。`scripts\*.ps1`、`test\gui_smoke.ps1` 保持 **ASCII**（要中文请用 `[char]0xXXXX` 或从文件读），或存 UTF-8 with BOM。`tools\wer.py` 因此只输出 ASCII 关键字 `ERROR_RATE:` 供 ps1 正则取用。
 21. mixed 重叠窗的**所有权 horizon（29 s）**是启发式：被丢弃的尾部段依赖下一窗重新识别，边界仍可能出现“上一段尾被切掉”的情况；`dedupe_segments()` 只能处理文本前缀包含关系，处理不了完全错乱的重复。调 `own_horizon`/`hop` 后必须重跑长样本核对（`test\zh_long.wav`）。
+22. **`no_speech_thold` 是概率阈值，不是对数概率**：本版本 `state->no_speech_prob = probs[token_nosp]`（`src/whisper.cpp:7366`），判据是 `is_no_speech = no_speech_prob > no_speech_thold && avg_logprobs < logprob_thold`（`src/whisper.cpp:7791`），为真时**整个窗口的文本被丢弃且不进上下文**（`:7803/:7809`）。因此把它设成负数（网上/旧文档常见的 −0.6、−1.0 是对数概率语义）等于「凡是低置信窗一律丢掉」——在口音重/音质差的录音上表现为**成段丢字**，而不是“更保守”。本项目默认沿用库默认 0.6；要改只能按需用 `--no-speech-thold`，并在真实录音上 A/B 后才能采用。
+23. **`params.vad` 对 `whisper_full_with_state()` 无效**：VAD 只写在 `whisper_full()` / `whisper_full_parallel()` 里（`src/whisper.cpp:7964`、`:7994`），本项目走 `with_state` → 曾经 UI 复选框与 `--vad` 全是**空操作**（日志里连 `loading VAD model` 都不会出现）。现在改为自实现（见 §4），并记住两点：`whisper_vad_segments_get_segment_t0/t1` 返回**厘秒**（×10=ms，`samples_to_cs`，`src/whisper.cpp:5596`）；上游 VAD 是把语音段拼接后再识别，时间戳会整体前移，本项目按原始时间轴切块所以不会漂。**验证 VAD 是否真生效要看日志里有没有 `loading VAD model` + `VAD 原始语音段: N 段`**。
 
 ## 10. 代码风格
 

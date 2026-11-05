@@ -71,6 +71,11 @@ static int physical_core_count()
 
 Transcriber::~Transcriber()
 {
+    if (vctx_ != nullptr)
+    {
+        whisper_vad_free(vctx_);
+        vctx_ = nullptr;
+    }
     if (ctx_ != nullptr)
     {
         whisper_free(ctx_);
@@ -143,6 +148,27 @@ bool Transcriber::load(const EngineConfig &cfg, const LogFn &log, std::wstring &
     {
         err = L"该模型是纯英文模型，不能转写中文，请选择多语言模型 (如 ggml-large-v3-turbo)";
         return false;
+    }
+
+    if (cfg_.vad)
+    {
+        const std::string vad_u8 = u8(cfg_.vad_model_path);
+        if (vad_u8.empty())
+        {
+            log_line(L"未提供 VAD 模型路径，本次不使用 VAD");
+        }
+        else
+        {
+            vctx_ = whisper_vad_init_from_file_with_params(vad_u8.c_str(), whisper_vad_default_context_params());
+            if (vctx_ == nullptr)
+            {
+                log_line(L"VAD 模型加载失败，本次不使用 VAD: " + cfg_.vad_model_path);
+            }
+            else
+            {
+                log_line(L"VAD 已启用 (按语音段切窗，静音不送识别): " + cfg_.vad_model_path);
+            }
+        }
     }
 
     return true;
@@ -293,7 +319,10 @@ bool Transcriber::transcribe(const std::vector<float> &samples, std::vector<Segm
     {
         params.entropy_thold = 1.5f;
         params.logprob_thold = -1.2f;
-        params.no_speech_thold = -0.6f;
+    }
+    if (cfg_.no_speech_thold > -50.0f)
+    {
+        params.no_speech_thold = cfg_.no_speech_thold;
     }
     params.new_segment_callback = &Transcriber::on_new_segment;
     params.new_segment_callback_user_data = this;
@@ -307,39 +336,174 @@ bool Transcriber::transcribe(const std::vector<float> &samples, std::vector<Segm
         params.initial_prompt = cfg_.initial_prompt.c_str();
     }
 
-    const std::string vad_path = cfg_.vad ? u8(cfg_.vad_model_path) : std::string();
-    if (cfg_.vad && !vad_path.empty())
+    const whisper_vad_params vp = make_vad_params(high_quality);
+
+    auto apply_language = [&](whisper_full_params &p)
     {
-        params.vad = true;
-        params.vad_model_path = vad_path.c_str();
-        params.vad_params = whisper_vad_default_params();
-        if (high_quality)
+        switch (cfg_.lang)
         {
-            params.vad_params.threshold = 0.35f;
-            params.vad_params.speech_pad_ms = 150;
-            params.vad_params.min_silence_duration_ms = 300;
-            params.vad_params.max_speech_duration_s = 40.0f;
+        case LangMode::Zh:
+            p.language = "zh";
+            break;
+        case LangMode::En:
+            p.language = "en";
+            break;
+        default:
+            p.language = nullptr;
+            break;
         }
-        const VadTuning &vt = cfg_.vad_tuning;
-        if (vt.threshold >= 0.0f)
+        p.detect_language = false;
+        p.offset_ms = 0;
+        p.duration_ms = 0;
+    };
+
+    auto build_window_prompt = [&]()
+    {
+        window_prompt_.clear();
+        if (!cfg_.initial_prompt.empty())
         {
-            params.vad_params.threshold = vt.threshold;
+            window_prompt_ = cfg_.initial_prompt;
         }
-        if (vt.min_speech_duration_ms >= 0)
+        if (sink_ != nullptr && !sink_->empty())
         {
-            params.vad_params.min_speech_duration_ms = vt.min_speech_duration_ms;
+            std::string tail;
+            for (size_t i = sink_->size(); i > 0; --i)
+            {
+                const std::string &t = (*sink_)[i - 1].text;
+                if (tail.size() + t.size() + 1 > 400)
+                {
+                    break;
+                }
+                tail = t + " " + tail;
+            }
+            if (!tail.empty())
+            {
+                if (!window_prompt_.empty())
+                {
+                    window_prompt_ += " ";
+                }
+                window_prompt_ += tail;
+            }
         }
-        if (vt.min_silence_duration_ms >= 0)
+        if (window_prompt_.size() > 480)
         {
-            params.vad_params.min_silence_duration_ms = vt.min_silence_duration_ms;
+            size_t cut = window_prompt_.size() - 480;
+            while (cut < window_prompt_.size() && ((unsigned char)window_prompt_[cut] & 0xC0) == 0x80)
+            {
+                ++cut;
+            }
+            window_prompt_ = window_prompt_.substr(cut);
         }
-        if (vt.max_speech_duration_s > 0.0f)
+        params.initial_prompt = window_prompt_.empty() ? nullptr : window_prompt_.c_str();
+    };
+
+    if (vctx_ != nullptr)
+    {
+        std::vector<std::pair<int64_t, int64_t>> chunks;
+        if (!vad_chunks(samples.data(), n_samples, vp, chunks, err))
         {
-            params.vad_params.max_speech_duration_s = vt.max_speech_duration_s;
+            return false;
         }
-        if (vt.speech_pad_ms >= 0)
+        if (chunks.empty())
         {
-            params.vad_params.speech_pad_ms = vt.speech_pad_ms;
+            log_line(L"VAD 未检测到语音段，输出为空（静音不会被强行识别）");
+            if (progress_)
+            {
+                progress_(100, current_total_ms_, current_total_ms_);
+            }
+            return true;
+        }
+
+        int64_t covered_ms = 0;
+        for (const auto &c : chunks)
+        {
+            covered_ms += c.second - c.first;
+        }
+        const int coverage = current_total_ms_ > 0 ? (int)(covered_ms * 100 / current_total_ms_) : 0;
+
+        if (coverage >= 85)
+        {
+            log_line(L"VAD: 语音覆盖 " + std::to_wstring(coverage) + L"% → 整段连续识别（不切窗，保留完整上下文）");
+        }
+        else
+        {
+            log_line(L"VAD: 语音覆盖 " + std::to_wstring(coverage) + L"% → 按语音段切窗（跳过静音）");
+
+            if (cfg_.lang == LangMode::Mixed)
+            {
+                last_language_.clear();
+            }
+            window_count_ = (int)chunks.size();
+            int used = 0;
+            int64_t sent_ms = 0;
+
+            for (size_t ci = 0; ci < chunks.size(); ++ci)
+            {
+                if (cancel_.load())
+                {
+                    err = L"已取消";
+                    return false;
+                }
+
+                const int64_t ms0 = chunks[ci].first;
+                const int64_t ms1 = chunks[ci].second;
+                const int64_t s0 = ms0 * WHISPER_SAMPLE_RATE / 1000;
+                const int64_t s1 = std::min<int64_t>((int64_t)n_samples, ms1 * WHISPER_SAMPLE_RATE / 1000);
+                if (s1 - s0 < WHISPER_SAMPLE_RATE / 5)
+                {
+                    continue;
+                }
+
+                sent_ms += (s1 - s0) * 1000 / WHISPER_SAMPLE_RATE;
+                window_index_ = (int)ci;
+                window_base_ms_ = ms0;
+                window_own_limit_ms_ = 0;
+                ++used;
+
+                build_window_prompt();
+                apply_language(params);
+
+                const int ret = whisper_full_with_state(ctx_, state_, params, samples.data() + s0, (int)(s1 - s0));
+                if (cancel_.load())
+                {
+                    err = L"已取消";
+                    return false;
+                }
+                if (ret != 0)
+                {
+                    err = L"转写失败 (whisper_full 返回 " + std::to_wstring(ret) + L")";
+                    return false;
+                }
+
+                if (cfg_.lang == LangMode::Mixed)
+                {
+                    const int lang_id = whisper_full_lang_id_from_state(state_);
+                    const char *lang = lang_id >= 0 ? whisper_lang_str(lang_id) : nullptr;
+                    if (lang != nullptr)
+                    {
+                        last_language_ += lang;
+                        last_language_ += ' ';
+                    }
+                }
+                else
+                {
+                    const int lang_id = whisper_full_lang_id_from_state(state_);
+                    const char *lang = lang_id >= 0 ? whisper_lang_str(lang_id) : nullptr;
+                    last_language_ = lang != nullptr ? lang : "";
+                }
+            }
+
+            log_line(L"VAD 切窗: " + std::to_wstring(used) + L" 块，实际送识别 " + std::to_wstring(sent_ms / 1000) +
+                     L" s / 文件 " + std::to_wstring(current_total_ms_ / 1000) + L" s");
+
+            dedupe_segments(out);
+            apply_terms(out);
+
+            if (progress_)
+            {
+                progress_(100, current_total_ms_, current_total_ms_);
+            }
+            return true;
         }
     }
 
@@ -372,43 +536,7 @@ bool Transcriber::transcribe(const std::vector<float> &samples, std::vector<Segm
             window_base_ms_ = start * 1000 / WHISPER_SAMPLE_RATE;
             window_own_limit_ms_ = std::min(own_horizon_ms, win_ms);
 
-            window_prompt_.clear();
-            if (!cfg_.initial_prompt.empty())
-            {
-                window_prompt_ = cfg_.initial_prompt;
-            }
-            if (sink_ != nullptr && !sink_->empty())
-            {
-                std::string tail;
-                for (size_t i = sink_->size(); i > 0; --i)
-                {
-                    const std::string &t = (*sink_)[i - 1].text;
-                    if (tail.size() + t.size() + 1 > 400)
-                    {
-                        break;
-                    }
-                    tail = t + " " + tail;
-                }
-                if (!tail.empty())
-                {
-                    if (!window_prompt_.empty())
-                    {
-                        window_prompt_ += " ";
-                    }
-                    window_prompt_ += tail;
-                }
-            }
-            if (window_prompt_.size() > 480)
-            {
-                size_t cut = window_prompt_.size() - 480;
-                while (cut < window_prompt_.size() && ((unsigned char)window_prompt_[cut] & 0xC0) == 0x80)
-                {
-                    ++cut;
-                }
-                window_prompt_ = window_prompt_.substr(cut);
-            }
-            params.initial_prompt = window_prompt_.empty() ? nullptr : window_prompt_.c_str();
-
+            build_window_prompt();
             params.language = nullptr;
             params.detect_language = false;
             params.offset_ms = 0;
@@ -670,4 +798,105 @@ void Transcriber::dedupe_segments(std::vector<Segment> &segs)
         kept.push_back(std::move(s));
     }
     segs.swap(kept);
+}
+
+whisper_vad_params Transcriber::make_vad_params(bool high_quality) const
+{
+    whisper_vad_params vp = whisper_vad_default_params();
+    if (high_quality)
+    {
+        vp.threshold = 0.35f;
+        vp.speech_pad_ms = 150;
+        vp.min_silence_duration_ms = 300;
+        vp.max_speech_duration_s = 40.0f;
+    }
+    const VadTuning &vt = cfg_.vad_tuning;
+    if (vt.threshold >= 0.0f)
+    {
+        vp.threshold = vt.threshold;
+    }
+    if (vt.min_speech_duration_ms >= 0)
+    {
+        vp.min_speech_duration_ms = vt.min_speech_duration_ms;
+    }
+    if (vt.min_silence_duration_ms >= 0)
+    {
+        vp.min_silence_duration_ms = vt.min_silence_duration_ms;
+    }
+    if (vt.max_speech_duration_s > 0.0f)
+    {
+        vp.max_speech_duration_s = vt.max_speech_duration_s;
+    }
+    if (vt.speech_pad_ms >= 0)
+    {
+        vp.speech_pad_ms = vt.speech_pad_ms;
+    }
+    return vp;
+}
+
+bool Transcriber::vad_chunks(const float *samples, int n_samples, const whisper_vad_params &vp,
+    std::vector<std::pair<int64_t, int64_t>> &chunks, std::wstring &err)
+{
+    whisper_vad_segments *segs = whisper_vad_segments_from_samples(vctx_, vp, samples, n_samples);
+    if (segs == nullptr)
+    {
+        err = L"VAD 检测失败 (whisper_vad_segments_from_samples 返回空)";
+        return false;
+    }
+
+    const int n = whisper_vad_segments_n_segments(segs);
+    const int64_t max_chunk_ms = 28000;
+    const int64_t max_gap_ms = 1000;
+
+    int64_t cur0 = -1;
+    int64_t cur1 = -1;
+    for (int i = 0; i < n; ++i)
+    {
+        if (cancel_.load())
+        {
+            whisper_vad_free_segments(segs);
+            err = L"已取消";
+            return false;
+        }
+
+        const int64_t s = (int64_t)(whisper_vad_segments_get_segment_t0(segs, i) * 10.0 + 0.5);
+        const int64_t e = (int64_t)(whisper_vad_segments_get_segment_t1(segs, i) * 10.0 + 0.5);
+        if (e <= s)
+        {
+            continue;
+        }
+
+        if (cur0 < 0)
+        {
+            cur0 = s;
+            cur1 = e;
+            continue;
+        }
+        if (e - cur0 <= max_chunk_ms && s - cur1 <= max_gap_ms)
+        {
+            cur1 = e;
+            continue;
+        }
+        chunks.emplace_back(cur0, cur1);
+        cur0 = s;
+        cur1 = e;
+    }
+    if (cur0 >= 0)
+    {
+        chunks.emplace_back(cur0, cur1);
+    }
+
+    log_line(L"VAD 原始语音段: " + std::to_wstring(n) + L" 段" +
+             (chunks.empty() ? L"" : L" -> 合并为 " + std::to_wstring(chunks.size()) + L" 块"));
+    if (!chunks.empty())
+    {
+        wchar_t buf[128];
+        swprintf(buf, 128, L"  首块 %.1f-%.1f s, 末块 %.1f-%.1f s", (double)chunks.front().first / 1000.0,
+            (double)chunks.front().second / 1000.0, (double)chunks.back().first / 1000.0,
+            (double)chunks.back().second / 1000.0);
+        log_line(buf);
+    }
+
+    whisper_vad_free_segments(segs);
+    return true;
 }

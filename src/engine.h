@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct Segment
@@ -51,6 +52,7 @@ struct EngineConfig
     std::string initial_prompt;
     std::vector<std::pair<std::string, std::string>> terms;
     VadTuning vad_tuning;
+    float no_speech_thold = -100.0f;
 };
 
 class Transcriber
@@ -81,9 +83,13 @@ private:
     void emit_segments(struct whisper_state *state, int n_new);
     void apply_terms(std::vector<Segment> &segs) const;
     static void dedupe_segments(std::vector<Segment> &segs);
+    whisper_vad_params make_vad_params(bool high_quality) const;
+    bool vad_chunks(const float *samples, int n_samples, const whisper_vad_params &vp,
+        std::vector<std::pair<int64_t, int64_t>> &chunks, std::wstring &err);
 
     struct whisper_context *ctx_ = nullptr;
     struct whisper_state *state_ = nullptr;
+    struct whisper_vad_context *vctx_ = nullptr;
     EngineConfig cfg_;
     std::atomic<bool> cancel_{false};
 

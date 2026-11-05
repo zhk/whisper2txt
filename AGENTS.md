@@ -42,7 +42,8 @@
 7. 若动了**识别参数或音频预处理**：跑 A/B 而不是只看能不能跑通 ——
    `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ab_quality.ps1 -Exe dist\whisper2txt.exe -Audio test\zh_long.wav -Ref test\ref_zh_long.txt -Terms <terms.txt> -Out ab`
    对比 `错误率` 与 `速度倍`；**没有真实录音标准答案时，不要把 TTS 样本上的数字当结论**（见 techdesign §9 #18/#19）。
-8. 若改了 UI 控件：用 `EnumChildWindows`+`GetWindowRect` 脚本核对 880×520 / 900×560 / 放大三种尺寸无重叠（临时脚本不入库）。
+   另：勾选/传了 `--vad` 就必须确认日志里出现 `loading VAD model` 与 `VAD 原始语音段: N 段 -> 合并为 M 块`，否则 VAD 根本没生效（`params.vad` 对 `whisper_full_with_state` 无效，见 §9 #23）。纯静音样本应输出 **0 行**（曾是 1 行幻觉）。
+8. 若改了 UI 控件：用 `EnumChildWindows`+`GetWindowRect` 脚本核对 880×520 / 900×560 / 放大三种尺寸无重叠（临时脚本不入库）。**不要同时开两个 GUI 实例跑自动化**（两个进程各自载 1.6 GB 模型会互相拖慢，导致 `OUTPUT_TIMEOUT` 假失败）。
 
 ## Shell 注意（Windows PowerShell 5.1）
 

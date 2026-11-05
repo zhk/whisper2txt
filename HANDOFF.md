@@ -4,12 +4,12 @@
 
 ## 一句话现状
 
-功能已全部可用的阶段：`whisper2txt`（C++17 + 纯 Win32 + whisper.cpp large-v3-turbo）已完成 GUI + CLI + MP3 解码 + 同名 `.txt`/`.srt` 输出 + 模型自动下载续传/镜像回退 + 取消 + 批量 + VAD 加速，并已端到端实测通过。**2026-11-04 起改为动态库分发**：`whisper.dll/ggml.dll/ggml-base.dll` + 运行时按需加载的后端 DLL（`ggml-cuda.dll` / `ggml-vulkan.dll` / 9 个 `ggml-cpu-*.dll`），一次构建同时支持 NVIDIA(CUDA 13.4) 与 AMD(Vulkan)，`whisper2txt.exe` 仅 ~800 KB；`use_gpu=true`（无 GPU 自动回落 CPU），CUDA0 实测优先、缺 cuda DLL 自动落 Vulkan0。**同日新增识别率调优套件**：音频预处理（较响声道 + 100 Hz 高通 + 峰值归一化）、`质量` 两档（fast greedy / high beam5 + 阈值与 VAD 调参）、术语表（`initial_prompt` + `错=>对` 后处理替换）、分段去重、mixed 28/30 重叠窗 + 跨窗上下文、GPU `flash_attn`，以及 A/B 评分工具（`scripts\ab_quality.ps1` + `tools\wer.py`）。**本次调优套件未 commit**（`git status` 应为 13 个 M + 3 个 ??：`src/audio.*`、`src/engine.*`、`src/main.cpp`、`src/ui.*`、5 份文档、`.gitignore`，新增 `scripts\ab_quality.ps1`、`tools\wer.py`、`test\ref_zh_long.txt`）。上一个 commit 是 `ba55db6 GPU acceleration enable`（已含动态库分发 + GPU + Allman 格式化 + `.clang-format`）。
+功能已全部可用的阶段：`whisper2txt`（C++17 + 纯 Win32 + whisper.cpp large-v3-turbo）已完成 GUI + CLI + MP3 解码 + 同名 `.txt`/`.srt` 输出 + 模型自动下载续传/镜像回退 + 取消 + 批量 + VAD 加速，并已端到端实测通过。**2026-11-04 起改为动态库分发**：`whisper.dll/ggml.dll/ggml-base.dll` + 运行时按需加载的后端 DLL（`ggml-cuda.dll` / `ggml-vulkan.dll` / 9 个 `ggml-cpu-*.dll`），一次构建同时支持 NVIDIA(CUDA 13.4) 与 AMD(Vulkan)，`whisper2txt.exe` 仅 ~800 KB；`use_gpu=true`（无 GPU 自动回落 CPU），CUDA0 实测优先、缺 cuda DLL 自动落 Vulkan0。**同日新增识别率调优套件**：音频预处理（较响声道 + 100 Hz 高通 + 峰值归一化）、`质量` 两档（fast greedy / high beam5 + 阈值与 VAD 调参）、术语表（`initial_prompt` + `错=>对` 后处理替换）、分段去重、mixed 28/30 重叠窗 + 跨窗上下文、GPU `flash_attn`，以及 A/B 评分工具（`scripts\ab_quality.ps1` + `tools\wer.py`）。**同日复查时发现并修掉两个真实 bug**：(a) VAD 从来是空操作（whisper 的 `params.vad` 只在 `whisper_full()` 生效，我们全用 `whisper_full_with_state()`）→ 改成自己用 `whisper_vad_*` 切块（含“语音覆盖 ≥85% 就不切窗”的启发式，时间戳保持原始轴）；(b) high 预设里 `no_speech_thold=-0.6` 是错误语义（该字段是概率阈值，负数=低置信窗整窗丢字）→ 改回库默认 0.6 并加 `--no-speech-thold`。实测：30 s 纯静音从 1 行幻觉变 0 行；large-v3（已缓存 3.09 GB）+ 术语表把衰减 28 dB 的差录音从 3.27% 降到 **0.65%**（11.9× 实时）。**本次改动未 commit**（`git status`：13 个 M + `scripts/ab_quality.ps1`、`tools/wer.py`、`test/ref_zh_long.txt`）。上一个 commit 是 `ba55db6 GPU acceleration enable`（已含动态库分发 + GPU + Allman 格式化 + `.clang-format`）。
 
 ## 接手必读顺序
 
 1. 本文件
-2. `techdesign.md` §9「已知坑清单」（21 条，全部会踩）
+2. `techdesign.md` §9「已知坑清单」（23 条，全部会踩）
 3. `progress.md` 实测数据表 + 遗留清单
 4. 需要改代码时：`src/engine.cpp`（whisper 调用细节）、`src/main.cpp`（GUI/CLI/线程/消息）
 
@@ -56,10 +56,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File test\gui_smoke.ps1 `
 
 | 优先级 | 任务 | 说明 |
 |---|---|---|
-| 高 | **真实录音 A/B 标定** | 用用户自己的 10–60 min 真实 MP3（口音重/音质差）跑 `scripts\ab_quality.ps1`：定出预处理开/关、high/fast、是否换 large-v3、术语表内容。**当前所有调优参数只在干净 TTS 样本上验证过**，不能当结论 |
+| 高 | **真实录音 A/B 标定** | 用用户自己的 10–60 min 真实 MP3（口音重/音质差）跑 `scripts\ab_quality.ps1`：定出预处理开/关、high/fast、是否换 large-v3、术语表内容、VAD 开/关。**当前调优数字只在 TTS 样本（含衰减 28 dB 变体）上得到**，不能当结论 |
 | 高 | 真实长 MP3 压力测试 | 验证内存、边界质量、是否需要自动分段与 `duration_ms` 分块 |
 | 高 | git 首次提交 + 分阶段 commit | 用户未要求前不要 push；只 commit 本地 |
-| 中 | 预处理/术语表参数暴露到 UI | 现在 UI 只有「音频预处理」总开关 + 术语表按钮；高通 Hz、增益目标、VAD 阈值/填充只有 CLI（`--highpass` / `--vad-threshold` / `--vad-pad`） |
+| 中 | VAD 覆盖度阈值标定 | 现在硬编码 `coverage >= 85%` 走整段识别（`src/engine.cpp` 的 transcribe VAD 分支）；真实录音里多少占比以上该整段、多少该切块，需要 A/B 数据支撑，可能要挪到 CLI/UI |
+| 中 | 预处理/术语表参数暴露到 UI | 现在 UI 只有「音频预处理」总开关（高通固定 100 Hz，见 `read_settings`）+ 术语表按钮；高通 Hz、增益目标、VAD 阈值/填充、`--no-speech-thold` 只有 CLI |
 | 中 | 设置持久化 | 目前每次启动回到默认值；可写 `%LOCALAPPDATA%\WhisperTxt\settings.ini`（记住模型槽、语言、质量、复选框、术语表路径） |
 | 中 | 可选降噪（谱减/RNNoise） | 默认**别开**——过度降噪会显著降识别率；实现后必须 A/B |
 | 中 | 版本信息与图标（.rc） | 便于用户识别版本；注意 rc.exe 与 CMake 集成 |
@@ -79,11 +80,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File test\gui_smoke.ps1 `
 
 | 位置 | 内容 |
 |---|---|
-| `src/engine.cpp:90` | `Transcriber::load()`：`ggml_backend_load_all()`（必需）+ GPU/CPU 选择（`cparams.use_gpu`、GPU 上 `flash_attn`）+ 设备日志 |
+| `src/engine.cpp:95` | `Transcriber::load()`：`ggml_backend_load_all()`（必需）+ GPU/CPU 选择（`cparams.use_gpu`、GPU 上 `flash_attn`）+ 设备日志 + `:162` VAD 上下文 `whisper_vad_init_from_file_with_params()`（失败只警告不报错） |
 | `src/engine.cpp:36` | `gpu_device_list()`：枚举已加载后端里的 GPU 设备名（用于日志与「无 GPU 自动回落」提示） |
-| `src/engine.cpp:254` | `Transcriber::transcribe()`：质量预设（fast greedy / high beam5 + 阈值）、`initial_prompt`、VAD 调参；非 mixed 单调用 / mixed 28/30 重叠窗循环；末尾去重 + 术语替换 |
-| `src/engine.cpp:174` | `emit_segments`：分段抽取 + 厘秒→ms + `window_base_ms_` 偏移 + mixed 所有权 horizon（`window_own_limit_ms_`）+ 过滤空段/`[BLANK_AUDIO]` |
-| `src/engine.cpp:588` / `:632` | `apply_terms()`（`错=>对` 替换，英文按词边界） / `dedupe_segments()`（归一化文本后的重复与前缀包含合并） |
+| `src/engine.cpp:280` | `Transcriber::transcribe()`：质量预设（fast greedy / high beam5 + 阈值）、`initial_prompt`、`apply_language()`/`build_window_prompt()` 两个 lambda、**VAD 切块分支（覆盖度 ≥85% 走整段）**、mixed 28/30 重叠窗、非 mixed 单调用；末尾去重 + 术语替换 |
+| `src/engine.cpp:200` | `emit_segments`：分段抽取 + 厘秒→ms + `window_base_ms_` 偏移 + mixed 所有权 horizon（`window_own_limit_ms_`）+ 过滤空段/`[BLANK_AUDIO]` |
+| `src/engine.cpp:716` / `:760` | `apply_terms()`（`错=>对` 替换，英文按词边界） / `dedupe_segments()`（归一化文本后的重复与前缀包含合并） |
+| `src/engine.cpp:803` / `:837` | `make_vad_params()`（预设 + `VadTuning` 覆盖） / `vad_chunks()`（`whisper_vad_segments_from_samples` 的**厘秒**×10 → 合并 ≤28 s 块、间隔 ≤1 s；打日志「VAD 原始语音段: N 段 -> 合并为 M 块」） |
 | `src/engine.cpp:58` | `physical_core_count()`：CPUID 判超线程 → 默认线程数 |
 | `src/audio.cpp:81` | `decode_audio_16k_mono(...)`：`channels=0` 保持原声道 → 声道能量统计/取较响声道 → `highpass_biquad()`(:47) → 峰值归一化；输出 `AudioStats` |
 | `src/main.cpp:164` | `ensure_transcriber_ctx()`：signature（含 quality/promptHash/termsCount/vad 调参）+ `EngineConfig` 填充 |

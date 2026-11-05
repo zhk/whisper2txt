@@ -67,7 +67,7 @@
 
 ### 识别率调优后实测（2026-11-04 同日，RTX 5070 Ti + CUDA 13.4）
 
-新增能力：音频预处理（较响声道 + 100 Hz 高通 + 峰值归一化）、`--quality fast|high`（high = beam5 + `temperature_inc 0.4` / `entropy_thold 1.5` / `logprob_thold −1.2` / `no_speech_thold −0.6` + VAD 调参）、术语表（`initial_prompt` + `错=>对` 后处理替换）、分段去重、mixed 28/30 重叠窗 + 跨窗 prompt 携带、GPU `flash_attn`。
+新增能力：音频预处理（较响声道 + 100 Hz 高通 + 峰值归一化）、`--quality fast|high`（high = beam5 + `temperature_inc 0.4` / `entropy_thold 1.5` / `logprob_thold −1.2` + VAD 调参；`no_speech_thold` 保持库默认 0.6，见 techdesign §9 #22）、术语表（`initial_prompt` + `错=>对` 后处理替换）、分段去重、mixed 28/30 重叠窗 + 跨窗 prompt 携带、GPU `flash_attn`。
 
 | # | 样本 | 模式 | 音频 | 用时 | 速度 | 结果 |
 |---|---|---|---|---|---|---|
@@ -78,18 +78,32 @@
 | 17 | 同上 | turbo + mixed，high + VAD | 45 s | 1.1 s | 46.9× | 同上 |
 | 18 | 同上 | turbo + mixed，high + VAD + 术语表 | 45 s | 1.2 s | 48.7× | 专名纠正：`购语言`→`Go 语言`、`CodeReview`→`Code Review` |
 | 19 | 同上 | 术语表后处理替换验证 | — | — | — | `Prototype=>原型`、`设计方案=>设计规划` 生效 |
+| 20 | `zh_stereo.wav`（ch0=×0.2、ch1=原） | 预处理声道选择验证 | 15 s | 0.5 s | 33.4× | 日志「声道 2 取 ch1」，转写与单声道一致 |
+| 21 | `silence30.wav`（30 s 纯静音） | **修 VAD 前** turbo + high | 30 s | 0.2 s | 173× | 幻觉 1 行 `中文字幕志愿者 杨栋梁` |
+| 22 | 同上 | **修 VAD 后** turbo + high + VAD | 30 s | — | — | **0 行输出**（静音不再被强行识别） |
+| 23 | `zh_padded.wav`（20 s 静音+45 s 语音+15 s 静音） | turbo + high + VAD + 术语表 | 80 s | — | — | VAD 覆盖 55% → 切 2 块、只送 44 s；SRT 首段 `00:00:19,980`（时间轴不漂）；错误率 1.31% |
+| 24 | `zh_quiet.wav`（幅度 ×0.04 ≈ −28 dB，模拟差录音，`--no-preproc`） | turbo + high | 45 s | — | — | 3.27% |
+| 25 | 同上 | **large-v3** + high | 45 s | 3.8 s | 11.9× | **2.61%** |
+| 26 | 同上 | large-v3 + high + 术语表（含开预处理也一样） | 45 s | — | — | **0.65%** |
+| 27 | `zh_long.wav` | large-v3 + high + 术语表 | 45 s | — | — | **0.65%**（turbo 同配置 1.31%） |
 
-A/B 错误率（`scripts\ab_quality.ps1`，标准答案 `test\ref_zh_long.txt`，`tools\wer.py` 按字/词混合编辑距离）：
+A/B 错误率（`scripts\ab_quality.ps1`，标准答案 `test\ref_zh_long.txt`，`tools\wer.py` 按字/词混合编辑距离；VAD 修好后重测）：
 
 | 配置 | 速度 | 错误率 |
 |---|---|---|
-| fast（预处理开） | 81.7× | 3.27% |
-| fast + `--no-preproc` | 83.8× | 3.27% |
-| high | 47.0× | 3.27% |
-| high + VAD | 46.9× | 3.27% |
-| high + VAD + 术语表 | 48.7× | **1.31%** |
+| fast（预处理开） | 79.1× | 3.27% |
+| fast + `--no-preproc` | 82.3× | 3.27% |
+| high | 41.8× | 3.27% |
+| high + VAD（覆盖 ≥85% → 自动整段） | 40.2× | 3.27% |
+| high + VAD + 术语表 | 42.3× | **1.31%** |
+| large-v3 + high + 术语表 | — | **0.65%** |
 
-剩余 2 处差异是 `三点/3点`、`十/10` 这类数字写法（非识别错误）。**注意**：样本是干净 TTS 合成语音，只能证明机制生效与不劣化；口音重/音质差的真实录音必须重新 A/B（见 techdesign §9 #18/#19）。
+剩余 2 处差异是 `三点/3点`、`十/10` 这类数字写法（非识别错误）。**注意**：样本是 TTS 合成语音（`zh_quiet` 是它衰减 28 dB 的变体），只能证明机制生效与不劣化；口音重/音质差的真实录音必须重新 A/B（见 techdesign §9 #18/#19/#22/#23）。
+
+### 本轮复查修掉的两个真 bug（2026-11-04 晚）
+
+1. **VAD 之前完全无效**：whisper 的 `params.vad` 只在 `whisper_full()` 内实现，本项目全用 `whisper_full_with_state()` → UI 勾选与 `--vad` 是空操作（日志里连 `loading VAD model` 都没有）。改为自实现：`whisper_vad_segments_from_samples()`（**返回厘秒**）→ 合并 ≤28 s 块 → 逐块 `with_state` 并按块起点偏移时间戳；再加「语音覆盖 ≥85% 就整段识别」的启发式（否则连续录音切窗会把 3.27% 变 4.58%）。验证见上表 #21–#23。
+2. **`no_speech_thold=-0.6` 用错语义**：该字段在本版本是概率阈值（`no_speech_prob = probs[nospeech]`），负数等于「低置信窗一律丢整窗文本」→ 已从 high 预设移除，改回库默认 0.6，另加 `--no-speech-thold` 显式覆盖（见 techdesign §9 #22）。
 
 预处理观察：同一 TTS 样本开启预处理后分段 6→13、`三点`→`3点`，错误率不变 —— 说明预处理会改变 whisper 的分段/书写选择，必须实测而非臆断。
 

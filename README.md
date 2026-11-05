@@ -53,6 +53,7 @@ dist\whisper2txt.exe --cli test\a.mp3 test\b.mp3
   --highpass N                  高通截止 Hz（默认 100，0 = 关闭）
   --vad-threshold F             VAD 阈值（默认由质量模式决定：fast 0.5 / high 0.35）
   --vad-pad N                   VAD 语音段前后填充 ms（默认 fast 30 / high 150）
+  --no-speech-thold F           静音判定概率阈值（默认 0.6；负数会让低置信窗整窗丢弃，别乱设）
   --threads N                   默认物理核心数
   --vad                         启用 Silero VAD 跳过静音（需下载 VAD 模型）
   --overwrite                   覆盖已存在的输出
@@ -70,11 +71,12 @@ dist\whisper2txt.exe --cli test\a.mp3 test\b.mp3
 2. **术语表**（UI「选择术语表...」/ CLI `--terms 文件`）：UTF-8 文本，每行一条，`#`/`;` 开头为注释。
    - 普通行 → 拼成 whisper 的 `initial_prompt`（上限 ~420 字节），直接提升专有名词命中率，并让标点/大小写风格更稳。
    - `识别错的=>想改成的` → 转写完成后的后处理替换（英文按单词边界，中文按子串）。
-3. **质量模式 high**：`WHISPER_SAMPLING_BEAM_SEARCH`（beam 5）+ `temperature_inc=0.4` + `entropy_thold=1.5` + `logprob_thold=−1.2` + `no_speech_thold=−0.6`（更容易触发逐窗温度回退，弱音段落更不容易被砍成幻觉/重复），并自动把 VAD 调成 `threshold 0.35 / speech_pad 150 ms / min_silence 300 ms / max_speech 40 s`。
-4. **换模型 `large-v3`**：口音与噪声鲁棒性最好，GPU 上仍远超实时（16 GB 显存放得下）。
-5. **语言明确指定**（别用 auto/mixed）：误判语种是差录音里最大的错词来源；中英夹杂选 `zh`，纯英文选 `en`。
-6. **重复/边界处理**：mixed 改 28/30 秒重叠窗 + 每窗携带上一窗尾部文本作 prompt + 分段去重（时间重叠 + 文本前缀包含判重）。
-7. **量化 A/B**（需要 Python，仅评分用，不参与编译）：
+3. **质量模式 high**：`WHISPER_SAMPLING_BEAM_SEARCH`（beam 5）+ `temperature_inc=0.4` + `entropy_thold=1.5` + `logprob_thold=−1.2`（更容易触发逐窗温度回退，弱音段落更不容易被砍成幻觉/重复），并自动把 VAD 调成 `threshold 0.35 / speech_pad 150 ms / min_silence 300 ms / max_speech 40 s`。`no_speech_thold` 保持库默认 `0.6`（要改只按需用 `--no-speech-thold F`，**不要设成负数**，见 techdesign §9 #22）。
+4. **换模型 `large-v3`**：口音与噪声鲁棒性最好，GPU 上仍远超实时（16 GB 显存放得下）。实测在衰减 28 dB 的“差录音”样本上：turbo 3.27% → large-v3 2.61%，再叠术语表 **0.65%**（large-v3 首载需下载 ~3.1 GB）。
+5. **VAD（勾选「启用 VAD 加速」/ `--vad`）**：本项目按语音段自己切块（≤28 s），**静音不送识别** —— 30 s 纯静音从 1 段幻觉文本变成 0 行；`.srt` 时间戳仍在原始时间轴上（首段可落在 `00:00:19,980`）。语音覆盖 ≥85% 时自动不切窗、整段识别（连续录音切窗会丢上下文，实测 3.27%→4.58%）。日志会打印 `VAD 原始语音段: N 段 -> 合并为 M 块` 与 `VAD: 语音覆盖 XX%`，**没有这两行说明 VAD 没生效**。
+6. **语言明确指定**（别用 auto/mixed）：误判语种是差录音里最大的错词来源；中英夹杂选 `zh`，纯英文选 `en`。
+7. **重复/边界处理**：mixed 改 28/30 秒重叠窗 + 每窗携带上一窗尾部文本作 prompt + 分段去重（时间重叠 + 文本前缀包含判重）。
+8. **量化 A/B**（需要 Python，仅评分用，不参与编译）：
 
 ```powershell
 # 一份“标准答案”txt（人工转写）后，一次跑完多组配置并给错误率
@@ -85,7 +87,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ab_quality.ps1 `
 python tools\wer.py test\ref_zh_long.txt ab\zh_long_high_vad_terms.txt
 ```
 
-实测（本机 RTX 5070 Ti，45 s 中英混合样本，`test\ref_zh_long.txt` 为标准答案）：fast/high/high+VAD 均 3.27% 错误率，加术语表后 **1.31%**（`Go 语言`、`Code Review` 这类专名被纠正，剩余 2 处只是 `三点/3点` 这类数字写法差异）。**结论必须用你自己的录音复现**——干净 TTS 样本只能证明流程可用。
+实测（本机 RTX 5070 Ti，45 s 中英混合样本，`test\ref_zh_long.txt` 为标准答案）：fast / high / high+VAD 均 **3.27%**，加术语表 **1.31%**（`Go 语言`、`Code Review` 被纠正，剩余 2 处只是 `三点/3点` 写法差异）。换 large-v3 后同一术语表 **0.65%**；把音频人为衰减 28 dB 模拟差录音时，large-v3+术语表仍是 **0.65%**（turbo 无术语表 3.27%），速度 11.9× 实时。30 s 纯静音：旧版输出 1 行幻觉（`中文字幕志愿者 杨栋梁`），现在 VAD 下 **0 行**。**结论必须用你自己的录音复现**——TTS 样本只能证明机制生效与不劣化。
 
 ## 从源码构建
 
