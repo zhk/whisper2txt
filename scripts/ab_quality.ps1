@@ -4,7 +4,7 @@ param(
     [string]$Terms = "",
     [string]$Ref = "",
     [string]$Out = "ab",
-    [string[]]$Configs = @("fast", "fast_noprep", "high", "high_vad", "high_vad_terms")
+    [string[]]$Configs = @("default_run", "fast", "fast_noprep", "high", "high_vad", "high_vad_terms")
 )
 $ErrorActionPreference = "Stop"
 
@@ -16,11 +16,12 @@ if (-not (Test-Path $Exe)) { throw "exe not found: $Exe" }
 $Exe = (Resolve-Path $Exe).Path
 
 $cfgFlags = [ordered]@{
-    fast           = @("--quality", "fast")
-    fast_noprep    = @("--quality", "fast", "--no-preproc")
-    high           = @("--quality", "high")
-    high_vad       = @("--quality", "high", "--vad")
-    high_vad_terms = @("--quality", "high", "--vad", "--terms", $Terms)
+    default_run      = @()
+    fast             = @("--quality", "fast")
+    fast_noprep      = @("--quality", "fast", "--no-preproc")
+    high             = @("--quality", "high")
+    high_vad         = @("--quality", "high", "--vad")
+    high_vad_terms   = @("--quality", "high", "--vad", "--terms", $Terms)
 }
 
 if ($Terms -eq "") {

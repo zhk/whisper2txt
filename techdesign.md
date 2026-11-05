@@ -121,12 +121,13 @@ WinHTTP 实现（不依赖 curl 外部进程）：
 ## 7. GUI（`src/ui.cpp`, `src/main.cpp`）
 
 - 纯 `CreateWindowExW` 控件：ListBox（多选、`LBS_EXTENDEDSEL`）、4 个 ComboBox（模型 / 语言 / 线程 / 质量）、5 个 Checkbox（同时生成 .srt / 覆盖已有输出 / 启用 VAD 加速 / 使用 GPU 加速 / 音频预处理）、5 个 Button（添加 / 移除 / 清空 / 打开输出目录 / 选择术语表）、进度条 `msctls_progress32`、只读 multiline Edit 日志。
+- **默认值（`WM_CREATE` 里设，`Settings` 结构体同值，CLI 不分 GUI/CLI 两套默认）**：质量 = `高精度 (beam5)`（`ComboBox_SetCurSel(combo_quality, 1)`）、VAD = 勾、音频预处理 = 勾、GPU = 勾、同时生成 .srt = 勾、覆盖已有输出 = 不勾；模型 = turbo、语言 = zh、线程 = 自动。要关 VAD/预处理用 `--no-vad` / `--no-preproc`，要更快用 `--quality fast`。
 - 字体 `Microsoft YaHei UI`，`CLEARTYPE_QUALITY`；`WM_SIZE → ui_layout()` 自适应重排（4 个 `STATIC` 标签 模型/语言/线程/质量 与各自 ComboBox 同列对齐；模型下拉宽度随窗口伸缩 `[150,340]`，语言 180 / 线程 80 / 质量 130 固定；「选择术语表」按钮固定在右列 chk_srt 下方）。
 - `DragAcceptFiles` + `WM_DROPFILES`（只接受 mp3/wav/flac）；`GetOpenFileNameW` + `OFN_ALLOWMULTISELECT|OFN_EXPLORER`（解析 `dir\0f1\0f2\0\0`）；术语表单选对话框见 `on_select_terms()`。
 - `IsDialogMessageW` 提供 Tab 导航；`WM_GETMINMAXINFO` 限制最小 **880×520**（4 个下拉 + 2 排复选框需要这个宽度才不重叠）。
 - 关闭：`WM_CLOSE/WM_DESTROY` → `stop=true, cancel=true` → 轮询 `running` 最多 30 s → `join()`。
 - CLI/GUI 分流：`CommandLineToArgvW`；有参数 → CLI（`--cli` 可显式）；`--gui 文件...` → GUI 预填文件列表。
-- CLI 选项与 UI 一一对应：`--model` / `--lang` / `--threads` / `--no-srt` / `--vad` / `--overwrite` / `--gpu`（默认）/ `--cpu` / `--quality fast|high` / `--terms 文件` / `--no-preproc` / `--highpass N` / `--vad-threshold F` / `--vad-pad N` / `--no-speech-thold F`。transcriber signature 含 `model|lang|threads|vad|use_gpu|quality|promptHash|termsCount|vadThreshold|vadPad|noSpeechThold`（切换这些会重载模型；预处理只影响音频，不参与 signature）。
+- CLI 选项与 UI 一一对应：`--model` / `--lang` / `--threads` / `--no-srt` / `--vad`（默认开，`--no-vad` 关）/ `--overwrite` / `--gpu`（默认）/ `--cpu` / `--quality fast|high`（默认 high）/ `--terms 文件` / `--no-preproc` / `--highpass N` / `--vad-threshold F` / `--vad-pad N` / `--no-speech-thold F`。transcriber signature 含 `model|lang|threads|vad|use_gpu|quality|promptHash|termsCount|vadThreshold|vadPad|noSpeechThold`（切换这些会重载模型；预处理只影响音频，不参与 signature）。
 - 术语表解析：`load_terms_file()`（`src/main.cpp:418`）读 UTF-8（跳 BOM），`#`/`;` 注释，`A=>B` → 后处理替换，其余行拼 `initial_prompt`（≤420 B）；结果存 `App::terms_prompt / terms_repl`，按钮文案回显文件名。
 - CLI 输出编码：`console_write()` 手写 UTF-8 字节 + `SetConsoleOutputCP(CP_UTF8)`；若 stdout 已重定向到文件则跳过 `AttachConsole`/`freopen("CONOUT$")`，否则日志文件会拿到乱码。
 

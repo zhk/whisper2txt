@@ -64,10 +64,10 @@ struct Settings
     LangMode lang = LangMode::Zh;
     int threads = 0;
     bool srt = true;
-    bool vad = false;
+    bool vad = true;
     bool overwrite = false;
     bool use_gpu = true;
-    int quality = 0;
+    int quality = 1;
     bool preproc = true;
     int highpass_hz = 100;
     float vad_threshold = -1.0f;
@@ -800,11 +800,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         ComboBox_AddString(app->ui.combo_quality, L"快速 (greedy)");
         ComboBox_AddString(app->ui.combo_quality, L"高精度 (beam5)");
-        ComboBox_SetCurSel(app->ui.combo_quality, 0);
+        ComboBox_SetCurSel(app->ui.combo_quality, 1);
 
         Button_SetCheck(app->ui.chk_srt, BST_CHECKED);
         Button_SetCheck(app->ui.chk_overwrite, BST_UNCHECKED);
-        Button_SetCheck(app->ui.chk_vad, BST_UNCHECKED);
+        Button_SetCheck(app->ui.chk_vad, BST_CHECKED);
         Button_SetCheck(app->ui.chk_gpu, BST_CHECKED);
         Button_SetCheck(app->ui.chk_preproc, BST_CHECKED);
 
@@ -815,7 +815,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         ui_append_log(app->ui, L"Whisper 本地转写工具 (whisper.cpp + large-v3-turbo)");
         ui_append_log(app->ui, L"拖放 MP3 到窗口，或点“添加 MP3 文件...”，输出同名 .txt (和 .srt)");
         ui_append_log(app->ui, L"模型缓存目录: " + models_dir());
-        ui_append_log(app->ui, L"识别效果不佳时: 质量选“高精度” + 勾选 VAD + 模型换 large-v3；“选择术语表...”可喂术语/纠错表");
+        ui_append_log(app->ui, L"默认已开: 质量=高精度、VAD 加速、音频预处理；要更快可改「快速」或取消 VAD/预处理");
+        ui_append_log(app->ui, L"识别效果不佳时: 模型换 large-v3（口音/音质鲁棒性最好），或点“选择术语表...”喂术语与“错=>对”纠错表");
 
         if (!g_prefill_files.empty())
         {
@@ -1069,6 +1070,11 @@ static int run_cli_mode()
             st.vad = true;
             continue;
         }
+        if (a == L"--no-vad")
+        {
+            st.vad = false;
+            continue;
+        }
         if (a == L"--gpu")
         {
             st.use_gpu = true;
@@ -1142,13 +1148,14 @@ static int run_cli_mode()
         console_write(L"用法: whisper2txt.exe [选项] 文件1.mp3 [文件2.mp3 ...]\n");
         console_write(L"  --model turbo|medium|large   默认 turbo (口音重/音质差建议 large)\n");
         console_write(L"  --lang zh|en|auto|mixed      默认 zh (mixed = 28/30 秒重叠窗逐窗检测语言)\n");
-        console_write(L"  --quality fast|high          默认 fast; high = beam5 + 更严的回退阈值 + VAD 调参\n");
+        console_write(L"  --quality fast|high          默认 high (beam5 + 更严的回退阈值 + VAD 调参); 要快用 fast\n");
         console_write(L"  --terms 术语表.txt           每行一个术语(喂给解码器作提示); “错=>对” 为后处理替换\n");
-        console_write(L"  --no-preproc                 关闭音频预处理 (默认: 取较响声道 + 峰值归一化 + 100Hz 高通)\n");
+        console_write(L"  --no-preproc                 关闭音频预处理 (默认开: 取较响声道 + 峰值归一化 + 100Hz 高通)\n");
         console_write(L"  --highpass N                 高通截止 Hz (默认 100, 0 = 关闭)\n");
+        console_write(L"  --vad / --no-vad             VAD 按语音段切窗、静音不送识别 (默认开)\n");
         console_write(L"  --vad-threshold F --vad-pad N  VAD 阈值/前后填充 (默认由质量模式决定)\n");
         console_write(L"  --no-speech-thold F          静音判定概率阈值 (默认 0.6; 调低更容易把低置信窗判为静音而丢弃)\n");
-        console_write(L"  --threads N   --no-srt   --vad   --overwrite   --gpu (默认) | --cpu\n");
+        console_write(L"  --threads N   --no-srt   --overwrite   --gpu (默认) | --cpu\n");
         console_write(L"输出: 与输入同目录同名的 .txt (和 .srt)\n");
         return 2;
     }

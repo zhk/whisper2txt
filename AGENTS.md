@@ -34,7 +34,7 @@
 ## 验证清单（每次改动后至少跑前 3 项）
 
 1. `powershell scripts\build.ps1` 无 error/LNK 错误。
-2. CLI 中文样本：`dist\whisper2txt.exe --cli --lang zh --overwrite test\zh_test.wav` → `test\zh_test.txt` 内容仍准确、速度在 ~1.3× 实时以上（GPU 发行包下应 ≥30×）。
+2. CLI 中文样本：`dist\whisper2txt.exe --cli --lang zh --overwrite test\zh_test.wav` → `test\zh_test.txt` 内容仍准确、速度在 ~1.3× 实时以上（GPU 发行包下应 ≥30×）。**出厂默认已是 质量=high + VAD + 预处理**，所以这条命令的日志里必须出现 `loading VAD model` 与 `VAD 原始语音段: N 段`；要测 CPU/快速档另加 `--cpu` / `--quality fast` / `--no-vad` / `--no-preproc`。
 3. CLI 混合模式：`--lang mixed`（长样本用 `test\zh_long.wav`）不产生空输出、无明显重复段、结尾不丢。
 4. GUI 自动化：`powershell -NoProfile -ExecutionPolicy Bypass -File test\gui_smoke.ps1 -Exe <exe> -Audio test\zh_test.wav` → 期望 `CLICKED_START` + `OUTPUT_CREATED`。
 5. 若动了下载器：删掉缓存模型（`%LOCALAPPDATA%\WhisperTxt\models\`）重跑，确认续传/切镜像日志。
