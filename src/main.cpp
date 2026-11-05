@@ -53,6 +53,9 @@ struct App
     std::unique_ptr<Transcriber> transcriber;
     std::string loaded_signature;
     std::wstring last_output_file;
+    std::wstring terms_path;
+    std::string terms_prompt;
+    std::vector<std::pair<std::string, std::string>> terms_repl;
 };
 
 struct Settings
@@ -64,6 +67,13 @@ struct Settings
     bool vad = false;
     bool overwrite = false;
     bool use_gpu = true;
+    int quality = 0;
+    bool preproc = true;
+    int highpass_hz = 100;
+    float vad_threshold = -1.0f;
+    int vad_pad_ms = -1;
+    std::string terms_prompt;
+    std::vector<std::pair<std::string, std::string>> terms_repl;
     std::vector<std::wstring> files;
 };
 
@@ -153,9 +163,12 @@ static bool ensure_model_ctx(JobContext &ctx, const ModelInfo &info, std::wstrin
 
 static bool ensure_transcriber_ctx(JobContext &ctx, Settings &st, std::wstring &err)
 {
+    const size_t prompt_h = std::hash<std::string>{}(st.terms_prompt);
     const std::string signature = std::to_string(st.model_slot) + "|" + std::to_string((int)st.lang) + "|" +
                                   std::to_string(st.threads) + "|" + std::to_string(st.vad ? 1 : 0) + "|" +
-                                  std::to_string(st.use_gpu ? 1 : 0);
+                                  std::to_string(st.use_gpu ? 1 : 0) + "|" + std::to_string(st.quality) + "|" +
+                                  std::to_string(prompt_h) + "|" + std::to_string(st.terms_repl.size()) + "|" +
+                                  std::to_string((int)(st.vad_threshold * 100.0f)) + "|" + std::to_string(st.vad_pad_ms);
 
     if (*ctx.transcriber != nullptr && *ctx.signature == signature)
     {
@@ -169,6 +182,16 @@ static bool ensure_transcriber_ctx(JobContext &ctx, Settings &st, std::wstring &
     cfg.lang = st.lang;
     cfg.vad = st.vad;
     cfg.use_gpu = st.use_gpu;
+    cfg.flash_attn = st.use_gpu;
+    cfg.quality = st.quality == 1 ? QualityMode::High : QualityMode::Fast;
+    cfg.initial_prompt = st.terms_prompt;
+    cfg.terms = st.terms_repl;
+    cfg.vad_tuning.threshold = st.vad_threshold;
+    cfg.vad_tuning.speech_pad_ms = st.vad_pad_ms;
+    if (st.quality == 1 && st.model_slot == SLOT_TURBO)
+    {
+        ctx.log(L"提示: 高精度模式下建议改用 large-v3 模型 (对口音与音质的鲁棒性更好)");
+    }
     if (st.vad)
     {
         cfg.vad_model_path = model_path(vad_model_info());
@@ -256,11 +279,24 @@ static bool run_files(JobContext &ctx, Settings st, std::wstring &job_message)
 
             ctx.progress(0, 0, 0, L"解码音频: " + name);
             std::vector<float> samples;
-            if (!decode_audio_16k_mono(file, samples, err))
+            AudioPreproc pp;
+            pp.select_loudest_channel = st.preproc;
+            pp.normalize = st.preproc;
+            pp.highpass_hz = st.preproc ? st.highpass_hz : 0;
+            AudioStats stats;
+            if (!decode_audio_16k_mono(file, samples, pp, stats, err))
             {
                 ctx.log(L"[失败] " + name + L": " + err);
                 ++fail_count;
                 continue;
+            }
+            if (stats.channels > 1 || stats.normalized || stats.highpassed)
+            {
+                wchar_t buf[160];
+                swprintf(buf, 160, L"音频预处理: 声道 %d 取 ch%d, 峰值 %.1f -> %.1f dBFS, 增益 %+.1f dB%s", stats.channels,
+                    stats.picked_channel, stats.peak_before_db, stats.peak_after_db, stats.gain_db,
+                    stats.highpassed ? L", 高通滤波" : L"");
+                ctx.log(buf);
             }
 
             const int64_t duration_ms = (int64_t)samples.size() * 1000 / WHISPER_SAMPLE_RATE;
@@ -367,6 +403,96 @@ static std::wstring read_combo_line(HWND combo)
     return text;
 }
 
+static void trim_u8(std::string &s)
+{
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r'))
+    {
+        s.erase(s.begin());
+    }
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r'))
+    {
+        s.pop_back();
+    }
+}
+
+static bool load_terms_file(const std::wstring &path, std::string &prompt,
+    std::vector<std::pair<std::string, std::string>> &repl, std::wstring &err)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        err = L"无法打开术语表文件: " + path;
+        return false;
+    }
+
+    std::string data;
+    char buf[8192];
+    DWORD got = 0;
+    while (ReadFile(h, buf, (DWORD)sizeof(buf), &got, nullptr) && got > 0)
+    {
+        data.append(buf, got);
+    }
+    CloseHandle(h);
+
+    if (data.size() >= 3 && (unsigned char)data[0] == 0xEF && (unsigned char)data[1] == 0xBB && (unsigned char)data[2] == 0xBF)
+    {
+        data.erase(0, 3);
+    }
+
+    prompt.clear();
+    repl.clear();
+    std::vector<std::string> terms;
+
+    size_t pos = 0;
+    while (pos <= data.size())
+    {
+        const size_t nl = data.find('\n', pos);
+        std::string line = (nl == std::string::npos) ? data.substr(pos) : data.substr(pos, nl - pos);
+        trim_u8(line);
+
+        if (!line.empty() && line[0] != '#' && line[0] != ';')
+        {
+            const size_t arrow = line.find("=>");
+            if (arrow != std::string::npos)
+            {
+                std::string from = line.substr(0, arrow);
+                std::string to = line.substr(arrow + 2);
+                trim_u8(from);
+                trim_u8(to);
+                if (!from.empty())
+                {
+                    repl.emplace_back(from, to);
+                }
+            }
+            else
+            {
+                terms.push_back(line);
+            }
+        }
+
+        if (nl == std::string::npos)
+        {
+            break;
+        }
+        pos = nl + 1;
+    }
+
+    for (const std::string &t : terms)
+    {
+        if (!prompt.empty())
+        {
+            prompt += ", ";
+        }
+        if (prompt.size() + t.size() + 2 > 420)
+        {
+            break;
+        }
+        prompt += t;
+    }
+
+    return true;
+}
+
 static Settings read_settings(App *app)
 {
     Settings st;
@@ -408,6 +534,14 @@ static Settings read_settings(App *app)
     st.vad = (SendMessageW(app->ui.chk_vad, BM_GETCHECK, 0, 0) == BST_CHECKED);
     st.overwrite = (SendMessageW(app->ui.chk_overwrite, BM_GETCHECK, 0, 0) == BST_CHECKED);
     st.use_gpu = (SendMessageW(app->ui.chk_gpu, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    st.preproc = (SendMessageW(app->ui.chk_preproc, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    st.highpass_hz = st.preproc ? 100 : 0;
+
+    const int quality_sel = (int)SendMessageW(app->ui.combo_quality, CB_GETCURSEL, 0, 0);
+    st.quality = quality_sel == 1 ? 1 : 0;
+
+    st.terms_prompt = app->terms_prompt;
+    st.terms_repl = app->terms_repl;
     st.files = app->ui.files;
     return st;
 }
@@ -558,6 +692,50 @@ static void on_open_output_dir(App *app)
     ShellExecuteW(app->ui.hwnd, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+static void on_select_terms(App *app)
+{
+    static wchar_t buffer[MAX_PATH * 8];
+    buffer[0] = 0;
+
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = app->ui.hwnd;
+    ofn.lpstrFilter = L"术语表 (*.txt)\0*.txt\0所有文件 (*.*)\0*.*\0\0";
+    ofn.lpstrFile = buffer;
+    ofn.nMaxFile = (DWORD)(sizeof(buffer) / sizeof(buffer[0]));
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+    ofn.lpstrTitle = L"选择术语表 (UTF-8 文本，每行一个术语；“错=>对” 为替换规则)";
+
+    if (!GetOpenFileNameW(&ofn))
+    {
+        return;
+    }
+
+    std::wstring err;
+    std::string prompt;
+    std::vector<std::pair<std::string, std::string>> repl;
+    if (!load_terms_file(buffer, prompt, repl, err))
+    {
+        ui_append_log(app->ui, L"[失败] " + err);
+        return;
+    }
+
+    app->terms_path = buffer;
+    app->terms_prompt = prompt;
+    app->terms_repl = repl;
+
+    const std::wstring name = file_name_of(buffer);
+    SetWindowTextW(app->ui.btn_terms, (L"术语表: " + name).c_str());
+
+    wchar_t buf[160];
+    swprintf(buf, 160, L"术语表已加载: 提示词 %d 字节, 替换规则 %d 条", (int)prompt.size(), (int)repl.size());
+    ui_append_log(app->ui, buf);
+    if (prompt.empty() && repl.empty())
+    {
+        ui_append_log(app->ui, L"注意: 文件里没有有效内容 (每行一个术语，或 “识别错的=>想改成的”)");
+    }
+}
+
 static void start_job(App *app)
 {
     if (app->running.load())
@@ -617,10 +795,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         ComboBox_SetCurSel(app->ui.combo_threads, 0);
 
+        ComboBox_AddString(app->ui.combo_quality, L"快速 (greedy)");
+        ComboBox_AddString(app->ui.combo_quality, L"高精度 (beam5)");
+        ComboBox_SetCurSel(app->ui.combo_quality, 0);
+
         Button_SetCheck(app->ui.chk_srt, BST_CHECKED);
         Button_SetCheck(app->ui.chk_overwrite, BST_UNCHECKED);
         Button_SetCheck(app->ui.chk_vad, BST_UNCHECKED);
         Button_SetCheck(app->ui.chk_gpu, BST_CHECKED);
+        Button_SetCheck(app->ui.chk_preproc, BST_CHECKED);
 
         DragAcceptFiles(hwnd, TRUE);
         ui_layout(app->ui);
@@ -629,6 +812,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         ui_append_log(app->ui, L"Whisper 本地转写工具 (whisper.cpp + large-v3-turbo)");
         ui_append_log(app->ui, L"拖放 MP3 到窗口，或点“添加 MP3 文件...”，输出同名 .txt (和 .srt)");
         ui_append_log(app->ui, L"模型缓存目录: " + models_dir());
+        ui_append_log(app->ui, L"识别效果不佳时: 质量选“高精度” + 勾选 VAD + 模型换 large-v3；“选择术语表...”可喂术语/纠错表");
 
         if (!g_prefill_files.empty())
         {
@@ -648,7 +832,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_GETMINMAXINFO:
     {
         auto *mmi = reinterpret_cast<MINMAXINFO *>(lp);
-        mmi->ptMinTrackSize.x = 780;
+        mmi->ptMinTrackSize.x = 880;
         mmi->ptMinTrackSize.y = 520;
         return 0;
     }
@@ -681,6 +865,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case 104:
             on_open_output_dir(app);
+            return 0;
+        case 105:
+            on_select_terms(app);
             return 0;
         case 401:
             start_job(app);
@@ -894,6 +1081,45 @@ static int run_cli_mode()
             st.overwrite = true;
             continue;
         }
+        if (a == L"--quality" && i + 1 < argc)
+        {
+            ++i;
+            st.quality = (_wcsicmp(argv[i], L"high") == 0) ? 1 : 0;
+            continue;
+        }
+        if (a == L"--terms" && i + 1 < argc)
+        {
+            ++i;
+            std::wstring terr;
+            if (!load_terms_file(argv[i], st.terms_prompt, st.terms_repl, terr))
+            {
+                console_write(terr + L"\n");
+            }
+            continue;
+        }
+        if (a == L"--no-preproc")
+        {
+            st.preproc = false;
+            continue;
+        }
+        if (a == L"--highpass" && i + 1 < argc)
+        {
+            ++i;
+            st.highpass_hz = _wtoi(argv[i]);
+            continue;
+        }
+        if (a == L"--vad-threshold" && i + 1 < argc)
+        {
+            ++i;
+            st.vad_threshold = (float)_wtof(argv[i]);
+            continue;
+        }
+        if (a == L"--vad-pad" && i + 1 < argc)
+        {
+            ++i;
+            st.vad_pad_ms = _wtoi(argv[i]);
+            continue;
+        }
         if (!a.empty() && a[0] == L'-')
         {
             console_write(L"未知选项: " + a + L"\n");
@@ -905,8 +1131,13 @@ static int run_cli_mode()
     if (st.files.empty())
     {
         console_write(L"用法: whisper2txt.exe [选项] 文件1.mp3 [文件2.mp3 ...]\n");
-        console_write(L"  --model turbo|medium|large   默认 turbo\n");
-        console_write(L"  --lang zh|en|auto|mixed      默认 zh (mixed = 每 30 秒窗自动检测语言)\n");
+        console_write(L"  --model turbo|medium|large   默认 turbo (口音重/音质差建议 large)\n");
+        console_write(L"  --lang zh|en|auto|mixed      默认 zh (mixed = 28/30 秒重叠窗逐窗检测语言)\n");
+        console_write(L"  --quality fast|high          默认 fast; high = beam5 + 更严的回退阈值 + VAD 调参\n");
+        console_write(L"  --terms 术语表.txt           每行一个术语(喂给解码器作提示); “错=>对” 为后处理替换\n");
+        console_write(L"  --no-preproc                 关闭音频预处理 (默认: 取较响声道 + 峰值归一化 + 100Hz 高通)\n");
+        console_write(L"  --highpass N                 高通截止 Hz (默认 100, 0 = 关闭)\n");
+        console_write(L"  --vad-threshold F --vad-pad N  VAD 阈值/前后填充 (默认由质量模式决定)\n");
         console_write(L"  --threads N   --no-srt   --vad   --overwrite   --gpu (默认) | --cpu\n");
         console_write(L"输出: 与输入同目录同名的 .txt (和 .srt)\n");
         return 2;

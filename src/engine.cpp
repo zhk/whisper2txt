@@ -122,7 +122,7 @@ bool Transcriber::load(const EngineConfig &cfg, const LogFn &log, std::wstring &
 
     whisper_context_params cparams = whisper_context_default_params();
     cparams.use_gpu = cfg_.use_gpu;
-    cparams.flash_attn = false;
+    cparams.flash_attn = cfg_.use_gpu && cfg_.flash_attn;
 
     const std::string model_u8 = u8(cfg_.model_path);
     ctx_ = whisper_init_from_file_with_params(model_u8.c_str(), cparams);
@@ -182,6 +182,11 @@ void Transcriber::emit_segments(struct whisper_state *state, int n_new)
     {
         int64_t t0 = whisper_full_get_segment_t0_from_state(state, i) * 10 + window_base_ms_;
         int64_t t1 = whisper_full_get_segment_t1_from_state(state, i) * 10 + window_base_ms_;
+
+        if (window_own_limit_ms_ > 0 && t0 - window_base_ms_ >= window_own_limit_ms_)
+        {
+            continue;
+        }
 
         const char *raw = whisper_full_get_segment_text_from_state(state, i);
         if (raw == nullptr)
@@ -263,10 +268,14 @@ bool Transcriber::transcribe(const std::vector<float> &samples, std::vector<Segm
     const int n_samples = (int)samples.size();
     current_total_ms_ = (int64_t)n_samples * 1000 / WHISPER_SAMPLE_RATE;
 
-    whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    const bool high_quality = cfg_.quality == QualityMode::High;
+
+    whisper_full_params params =
+        whisper_full_default_params(high_quality ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
     params.n_threads = cfg_.n_threads;
-    params.strategy = WHISPER_SAMPLING_GREEDY;
-    params.greedy.best_of = 1;
+    params.strategy = high_quality ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY;
+    params.greedy.best_of = high_quality ? 5 : 1;
+    params.beam_search.beam_size = high_quality ? 5 : -1;
     params.print_progress = false;
     params.print_realtime = false;
     params.print_special = false;
@@ -279,7 +288,13 @@ bool Transcriber::transcribe(const std::vector<float> &samples, std::vector<Segm
     params.suppress_nst = true;
     params.token_timestamps = false;
     params.max_len = 0;
-    params.temperature_inc = 0.2f;
+    params.temperature_inc = high_quality ? 0.4f : 0.2f;
+    if (high_quality)
+    {
+        params.entropy_thold = 1.5f;
+        params.logprob_thold = -1.2f;
+        params.no_speech_thold = -0.6f;
+    }
     params.new_segment_callback = &Transcriber::on_new_segment;
     params.new_segment_callback_user_data = this;
     params.progress_callback = &Transcriber::on_progress;
@@ -287,29 +302,62 @@ bool Transcriber::transcribe(const std::vector<float> &samples, std::vector<Segm
     params.abort_callback = &Transcriber::on_abort;
     params.abort_callback_user_data = this;
 
+    if (!cfg_.initial_prompt.empty())
+    {
+        params.initial_prompt = cfg_.initial_prompt.c_str();
+    }
+
     const std::string vad_path = cfg_.vad ? u8(cfg_.vad_model_path) : std::string();
     if (cfg_.vad && !vad_path.empty())
     {
         params.vad = true;
         params.vad_model_path = vad_path.c_str();
         params.vad_params = whisper_vad_default_params();
+        if (high_quality)
+        {
+            params.vad_params.threshold = 0.35f;
+            params.vad_params.speech_pad_ms = 150;
+            params.vad_params.min_silence_duration_ms = 300;
+            params.vad_params.max_speech_duration_s = 40.0f;
+        }
+        const VadTuning &vt = cfg_.vad_tuning;
+        if (vt.threshold >= 0.0f)
+        {
+            params.vad_params.threshold = vt.threshold;
+        }
+        if (vt.min_speech_duration_ms >= 0)
+        {
+            params.vad_params.min_speech_duration_ms = vt.min_speech_duration_ms;
+        }
+        if (vt.min_silence_duration_ms >= 0)
+        {
+            params.vad_params.min_silence_duration_ms = vt.min_silence_duration_ms;
+        }
+        if (vt.max_speech_duration_s > 0.0f)
+        {
+            params.vad_params.max_speech_duration_s = vt.max_speech_duration_s;
+        }
+        if (vt.speech_pad_ms >= 0)
+        {
+            params.vad_params.speech_pad_ms = vt.speech_pad_ms;
+        }
     }
 
     const int64_t win_samples = (int64_t)WHISPER_SAMPLE_RATE * 30;
+    const int64_t hop_samples = (int64_t)WHISPER_SAMPLE_RATE * 28;
+    const int64_t own_horizon_ms = 29000;
 
     if (cfg_.lang == LangMode::Mixed)
     {
-        window_count_ = (int)(((int64_t)n_samples + win_samples - 1) / win_samples);
+        window_count_ = (int)(((int64_t)n_samples + hop_samples - 1) / hop_samples);
         if (window_count_ < 1)
         {
             window_count_ = 1;
         }
         last_language_.clear();
 
-        std::vector<float> detected((size_t)whisper_lang_max_id() + 1, 0.0f);
-        (void)detected;
-
-        for (int64_t start = 0; start < n_samples; start += win_samples)
+        int wi = 0;
+        for (int64_t start = 0; start < n_samples; start += hop_samples, ++wi)
         {
             if (cancel_.load())
             {
@@ -318,9 +366,48 @@ bool Transcriber::transcribe(const std::vector<float> &samples, std::vector<Segm
             }
 
             const int n = (int)std::min<int64_t>(win_samples, (int64_t)n_samples - start);
+            const int64_t win_ms = (int64_t)n * 1000 / WHISPER_SAMPLE_RATE;
 
-            window_index_ = (int)(start / win_samples);
+            window_index_ = wi;
             window_base_ms_ = start * 1000 / WHISPER_SAMPLE_RATE;
+            window_own_limit_ms_ = std::min(own_horizon_ms, win_ms);
+
+            window_prompt_.clear();
+            if (!cfg_.initial_prompt.empty())
+            {
+                window_prompt_ = cfg_.initial_prompt;
+            }
+            if (sink_ != nullptr && !sink_->empty())
+            {
+                std::string tail;
+                for (size_t i = sink_->size(); i > 0; --i)
+                {
+                    const std::string &t = (*sink_)[i - 1].text;
+                    if (tail.size() + t.size() + 1 > 400)
+                    {
+                        break;
+                    }
+                    tail = t + " " + tail;
+                }
+                if (!tail.empty())
+                {
+                    if (!window_prompt_.empty())
+                    {
+                        window_prompt_ += " ";
+                    }
+                    window_prompt_ += tail;
+                }
+            }
+            if (window_prompt_.size() > 480)
+            {
+                size_t cut = window_prompt_.size() - 480;
+                while (cut < window_prompt_.size() && ((unsigned char)window_prompt_[cut] & 0xC0) == 0x80)
+                {
+                    ++cut;
+                }
+                window_prompt_ = window_prompt_.substr(cut);
+            }
+            params.initial_prompt = window_prompt_.empty() ? nullptr : window_prompt_.c_str();
 
             params.language = nullptr;
             params.detect_language = false;
@@ -348,6 +435,9 @@ bool Transcriber::transcribe(const std::vector<float> &samples, std::vector<Segm
             }
         }
 
+        dedupe_segments(out);
+        apply_terms(out);
+
         if (progress_)
         {
             progress_(100, current_total_ms_, current_total_ms_);
@@ -358,6 +448,7 @@ bool Transcriber::transcribe(const std::vector<float> &samples, std::vector<Segm
     window_count_ = 1;
     window_index_ = 0;
     window_base_ms_ = 0;
+    window_own_limit_ms_ = 0;
 
     switch (cfg_.lang)
     {
@@ -389,9 +480,194 @@ bool Transcriber::transcribe(const std::vector<float> &samples, std::vector<Segm
     const char *lang = lang_id >= 0 ? whisper_lang_str(lang_id) : nullptr;
     last_language_ = lang != nullptr ? lang : "";
 
+    dedupe_segments(out);
+    apply_terms(out);
+
     if (progress_)
     {
         progress_(100, current_total_ms_, current_total_ms_);
     }
     return true;
+}
+
+static bool ascii_iequals_ci(const std::string &s, size_t pos, const std::string &needle)
+{
+    if (pos + needle.size() > s.size())
+    {
+        return false;
+    }
+    for (size_t k = 0; k < needle.size(); ++k)
+    {
+        const unsigned char a = (unsigned char)s[pos + k];
+        const unsigned char b = (unsigned char)needle[k];
+        if (a == b)
+        {
+            continue;
+        }
+        const bool ascii_a = a < 0x80;
+        const bool ascii_b = b < 0x80;
+        if (!ascii_a || !ascii_b)
+        {
+            return false;
+        }
+        const unsigned char la = (a >= 'A' && a <= 'Z') ? (unsigned char)(a + 32) : a;
+        const unsigned char lb = (b >= 'A' && b <= 'Z') ? (unsigned char)(b + 32) : b;
+        if (la != lb)
+        {
+            return false;
+        }
+    }
+    const size_t end = pos + needle.size();
+    if (pos > 0)
+    {
+        const unsigned char prev = (unsigned char)s[pos - 1];
+        if (prev >= '0' && prev <= '9')
+        {
+            return false;
+        }
+        if ((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z'))
+        {
+            if (!needle.empty())
+            {
+                const unsigned char first = (unsigned char)needle[0];
+                if ((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || (first >= '0' && first <= '9'))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    if (end < s.size())
+    {
+        const unsigned char nxt = (unsigned char)s[end];
+        if ((nxt >= 'a' && nxt <= 'z') || (nxt >= 'A' && nxt <= 'Z') || (nxt >= '0' && nxt <= '9'))
+        {
+            if (!needle.empty())
+            {
+                const unsigned char last = (unsigned char)needle[needle.size() - 1];
+                if ((last >= 'a' && last <= 'z') || (last >= 'A' && last <= 'Z') || (last >= '0' && last <= '9'))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static void replace_term_ci(std::string &text, const std::string &from, const std::string &to)
+{
+    if (from.empty() || from == to)
+    {
+        return;
+    }
+    std::string res;
+    res.reserve(text.size());
+    size_t i = 0;
+    bool replaced = false;
+    while (i < text.size())
+    {
+        if (ascii_iequals_ci(text, i, from))
+        {
+            res += to;
+            i += from.size();
+            replaced = true;
+        }
+        else
+        {
+            res += text[i];
+            ++i;
+        }
+    }
+    if (replaced)
+    {
+        text.swap(res);
+    }
+}
+
+void Transcriber::apply_terms(std::vector<Segment> &segs) const
+{
+    if (cfg_.terms.empty())
+    {
+        return;
+    }
+    for (Segment &s : segs)
+    {
+        for (const auto &pair : cfg_.terms)
+        {
+            replace_term_ci(s.text, pair.first, pair.second);
+        }
+    }
+}
+
+static std::string norm_key(const std::string &text)
+{
+    std::string key;
+    key.reserve(text.size());
+    for (char c : text)
+    {
+        const unsigned char u = (unsigned char)c;
+        if (u == ' ' || u == '\t' || u == '\r' || u == '\n')
+        {
+            continue;
+        }
+        if (u < 0x80)
+        {
+            if (u == ',' || u == '.' || u == '!' || u == '?' || u == ';' || u == ':' || u == '"' || u == '\'' ||
+                u == '(' || u == ')')
+            {
+                continue;
+            }
+            if (u >= 'A' && u <= 'Z')
+            {
+                key += (char)(u + 32);
+                continue;
+            }
+        }
+        key += c;
+    }
+    return key;
+}
+
+void Transcriber::dedupe_segments(std::vector<Segment> &segs)
+{
+    if (segs.size() < 2)
+    {
+        return;
+    }
+
+    std::vector<Segment> kept;
+    kept.reserve(segs.size());
+    for (Segment &s : segs)
+    {
+        if (!kept.empty())
+        {
+            Segment &prev = kept.back();
+            const std::string a = norm_key(prev.text);
+            const std::string b = norm_key(s.text);
+            if (!a.empty() && a == b)
+            {
+                if (s.t1_ms > prev.t1_ms)
+                {
+                    prev.t1_ms = s.t1_ms;
+                }
+                continue;
+            }
+            if (!a.empty() && !b.empty() && s.t0_ms < prev.t1_ms - 300)
+            {
+                if (b.size() >= a.size() && b.compare(0, a.size(), a) == 0)
+                {
+                    prev.text = s.text;
+                    prev.t1_ms = s.t1_ms;
+                    continue;
+                }
+                if (a.size() > b.size() && a.compare(0, b.size(), b) == 0)
+                {
+                    continue;
+                }
+            }
+        }
+        kept.push_back(std::move(s));
+    }
+    segs.swap(kept);
 }

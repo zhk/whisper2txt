@@ -65,19 +65,52 @@
 另外,请大家把各自的Report提前发到群里,方便沟通。
 ```
 
+### 识别率调优后实测（2026-11-04 同日，RTX 5070 Ti + CUDA 13.4）
+
+新增能力：音频预处理（较响声道 + 100 Hz 高通 + 峰值归一化）、`--quality fast|high`（high = beam5 + `temperature_inc 0.4` / `entropy_thold 1.5` / `logprob_thold −1.2` / `no_speech_thold −0.6` + VAD 调参）、术语表（`initial_prompt` + `错=>对` 后处理替换）、分段去重、mixed 28/30 重叠窗 + 跨窗 prompt 携带、GPU `flash_attn`。
+
+| # | 样本 | 模式 | 音频 | 用时 | 速度 | 结果 |
+|---|---|---|---|---|---|---|
+| 13 | `zh_test.wav` | turbo + zh + 预处理 + flash_attn（现默认） | 15 s | 0.3 s | 58.8× | 内容正确，分段变细（2→5 段） |
+| 14 | 同上 | turbo + zh + high + VAD | 15 s | 0.4 s | 38.0× | 内容正确 |
+| 15 | 同上 | turbo + zh + CPU（预处理开） | 15 s | 9.1 s | 1.76× | 与 GPU 一致 |
+| 16 | `zh_long.wav`（新建 45 s 长样本） | turbo + mixed，fast | 45 s | 0.6 s | 81.7× | 10 段，无重复段，结尾不丢 |
+| 17 | 同上 | turbo + mixed，high + VAD | 45 s | 1.1 s | 46.9× | 同上 |
+| 18 | 同上 | turbo + mixed，high + VAD + 术语表 | 45 s | 1.2 s | 48.7× | 专名纠正：`购语言`→`Go 语言`、`CodeReview`→`Code Review` |
+| 19 | 同上 | 术语表后处理替换验证 | — | — | — | `Prototype=>原型`、`设计方案=>设计规划` 生效 |
+
+A/B 错误率（`scripts\ab_quality.ps1`，标准答案 `test\ref_zh_long.txt`，`tools\wer.py` 按字/词混合编辑距离）：
+
+| 配置 | 速度 | 错误率 |
+|---|---|---|
+| fast（预处理开） | 81.7× | 3.27% |
+| fast + `--no-preproc` | 83.8× | 3.27% |
+| high | 47.0× | 3.27% |
+| high + VAD | 46.9× | 3.27% |
+| high + VAD + 术语表 | 48.7× | **1.31%** |
+
+剩余 2 处差异是 `三点/3点`、`十/10` 这类数字写法（非识别错误）。**注意**：样本是干净 TTS 合成语音，只能证明机制生效与不劣化；口音重/音质差的真实录音必须重新 A/B（见 techdesign §9 #18/#19）。
+
+预处理观察：同一 TTS 样本开启预处理后分段 6→13、`三点`→`3点`，错误率不变 —— 说明预处理会改变 whisper 的分段/书写选择，必须实测而非臆断。
+
 ## 决策记录
 
 - **不用 Python/faster-whisper/PyInstaller**：避免 150–400 MB exe、冷启动、ffmpeg 依赖。
 - **不用 curl 外部进程下载**：改用 WinHTTP，进度可控、可取消、可续传、可切镜像。
 - **输出 `歌.txt`（替换扩展名）**，而不是 `歌.mp3.txt`。
-- **mixed 模式 = 30 s 窗 + 每窗 auto-detect**，不使用 `params.detect_language`（会只检测不转写）。
+- **mixed 模式 = 28/30 s 重叠窗 + 每窗 auto-detect**，不使用 `params.detect_language`（会只检测不转写）；每窗尾部 2 s 交给下一窗（所有权 horizon 29 s）+ 携带上一窗尾部文本作 `initial_prompt`。
 - **默认语言 = 中文(zh)**：对夹杂英文词的中文语音效果好且比 mixed 快约 2×。
+- **音频预处理默认开**（取较响声道 + 100 Hz 高通 + 峰值归一化到 −1 dBFS，增益限幅 ±24 dB）；`--no-preproc` 一键关掉，日志打印实测增益便于 A/B。
+- **默认质量档保持 fast(greedy, best_of=1)**：GPU 上 high 慢约 25–35% 但错误率在 TTS 样本上未见改善 → 把 high 作为可选项，真正的增益来自术语表与换 large-v3。
+- **术语表两用途**：普通行进 `initial_prompt`（偏置专名/风格），`A=>B` 行走后处理替换（英文按词边界）；上限 ~420 B 防止吃掉解码上下文。
+- **不做默认降噪**：过度降噪反而降识别率；要做得先 A/B。
 
 ## 遗留 / 待办
 
 - 用真实长中文 MP3（≥10 min）验证：长音频单次 `whisper_full` 的内存与边界质量、是否需要 >2 h 自动分段。
-- 混合语音的窗边界丢词观察（目前仅 15 s 样本）。
-- 未做：静音/长静音 VAD 参数调优、词级时间戳、说话人分离、翻译任务（turbo 不支持 translate）。
+- **真实录音上的调优标定**（当前调优参数只在干净 TTS 样本上验证）：用 `scripts\ab_quality.ps1` + 人工标准答案，定出预处理开关、fast/high、是否换 large-v3、术语表内容。
+- 混合语音的窗边界丢词观察（重叠窗已实现，但 45 s 样本上未覆盖“切在词中间”的极端情况）。
+- 未做：词级时间戳、说话人分离、翻译任务（turbo 不支持 translate）、可选降噪、UI 上的预处理/术语表细参数（高通 Hz、VAD 阈值）、设置持久化。
 - 未做：安装器/图标/版本信息资源（`.rc`），当前无版本号。
 - 未做：崩溃/异常日志落盘（目前仅 UI 日志区）。
 - `build_w/` 残留目录删除时被进程占用，可稍后手动删（已被 .gitignore 忽略）。

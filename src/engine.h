@@ -23,6 +23,21 @@ enum class LangMode
     Mixed,
 };
 
+enum class QualityMode
+{
+    Fast,
+    High,
+};
+
+struct VadTuning
+{
+    float threshold = -1.0f;
+    int min_speech_duration_ms = -1;
+    int min_silence_duration_ms = -1;
+    float max_speech_duration_s = -1.0f;
+    int speech_pad_ms = -1;
+};
+
 struct EngineConfig
 {
     std::wstring model_path;
@@ -31,6 +46,11 @@ struct EngineConfig
     LangMode lang = LangMode::Zh;
     bool vad = false;
     bool use_gpu = true;
+    bool flash_attn = false;
+    QualityMode quality = QualityMode::Fast;
+    std::string initial_prompt;
+    std::vector<std::pair<std::string, std::string>> terms;
+    VadTuning vad_tuning;
 };
 
 class Transcriber
@@ -59,6 +79,8 @@ private:
     static bool on_abort(void *user_data);
 
     void emit_segments(struct whisper_state *state, int n_new);
+    void apply_terms(std::vector<Segment> &segs) const;
+    static void dedupe_segments(std::vector<Segment> &segs);
 
     struct whisper_context *ctx_ = nullptr;
     struct whisper_state *state_ = nullptr;
@@ -72,7 +94,9 @@ private:
     int window_index_ = 0;
     int window_count_ = 1;
     int64_t window_base_ms_ = 0;
+    int64_t window_own_limit_ms_ = 0;
     int64_t current_total_ms_ = 0;
+    std::string window_prompt_;
 
     std::string last_language_;
 };

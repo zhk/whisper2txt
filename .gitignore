@@ -47,10 +47,14 @@ models/
 
 # 测试输出与测试音频（不提交大文件/个人音频）
 test/*.txt
+!test/ref_*.txt
 test/*.srt
 test/*.wav
 test/*.mp3
 test/*.flac
+
+# A/B 对比输出
+ab/
 
 # 临时文件
 *.tmp

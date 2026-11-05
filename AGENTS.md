@@ -34,17 +34,22 @@
 ## 验证清单（每次改动后至少跑前 3 项）
 
 1. `powershell scripts\build.ps1` 无 error/LNK 错误。
-2. CLI 中文样本：`build\Release\whisper2txt.exe --cli --lang zh --overwrite test\zh_test.wav` → `test\zh_test.txt` 内容仍准确、速度在 ~1.3× 实时以上。
-3. CLI 混合模式：`--lang mixed` 不产生空输出、无明显重复段。
+2. CLI 中文样本：`dist\whisper2txt.exe --cli --lang zh --overwrite test\zh_test.wav` → `test\zh_test.txt` 内容仍准确、速度在 ~1.3× 实时以上（GPU 发行包下应 ≥30×）。
+3. CLI 混合模式：`--lang mixed`（长样本用 `test\zh_long.wav`）不产生空输出、无明显重复段、结尾不丢。
 4. GUI 自动化：`powershell -NoProfile -ExecutionPolicy Bypass -File test\gui_smoke.ps1 -Exe <exe> -Audio test\zh_test.wav` → 期望 `CLICKED_START` + `OUTPUT_CREATED`。
 5. 若动了下载器：删掉缓存模型（`%LOCALAPPDATA%\WhisperTxt\models\`）重跑，确认续传/切镜像日志。
 6. 若改了 CMake 链接选项：`dumpbin /dependents` 确认只依赖系统 DLL + `VCOMP140.DLL`。
+7. 若动了**识别参数或音频预处理**：跑 A/B 而不是只看能不能跑通 ——
+   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ab_quality.ps1 -Exe dist\whisper2txt.exe -Audio test\zh_long.wav -Ref test\ref_zh_long.txt -Terms <terms.txt> -Out ab`
+   对比 `错误率` 与 `速度倍`；**没有真实录音标准答案时，不要把 TTS 样本上的数字当结论**（见 techdesign §9 #18/#19）。
+8. 若改了 UI 控件：用 `EnumChildWindows`+`GetWindowRect` 脚本核对 880×520 / 900×560 / 放大三种尺寸无重叠（临时脚本不入库）。
 
 ## Shell 注意（Windows PowerShell 5.1）
 
 - 不支持 `&&`，用 `; if ($?) { ... }` 或分步执行。
 - 切目录用工具的 `workdir` 参数，不要 `Set-Location` 内联。
 - 中文输出在控制台可能乱码：用 `Get-Content -Encoding UTF8` 或直接读文件验证。
+- **入库的 `.ps1` 里不要写中文字面量**（PS 5.1 按 ANSI 读，会解析错误）；要中文用 `[char]0xXXXX` 拼接或从文件读，或把脚本存成 UTF-8 with BOM。跨语言传数据用 ASCII 锚点（例：`tools\wer.py` 打印 `ERROR_RATE: 1.31%`）。
 - 构建/下载等长任务用 `Start-Process` 后台 + 轮询日志，避免超时被杀。
 
 ## Git 纪律

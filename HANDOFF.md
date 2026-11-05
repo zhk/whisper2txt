@@ -4,12 +4,12 @@
 
 ## 一句话现状
 
-功能已全部可用的阶段：`whisper2txt`（C++17 + 纯 Win32 + whisper.cpp large-v3-turbo）已完成 GUI + CLI + MP3 解码 + 同名 `.txt`/`.srt` 输出 + 模型自动下载续传/镜像回退 + 取消 + 批量 + VAD 加速，并已端到端实测通过。**2026-11-04 起改为动态库分发**：`whisper.dll/ggml.dll/ggml-base.dll` + 运行时按需加载的后端 DLL（`ggml-cuda.dll` / `ggml-vulkan.dll` / 9 个 `ggml-cpu-*.dll`），一次构建同时支持 NVIDIA(CUDA 13.4) 与 AMD(Vulkan)，`whisper2txt.exe` 仅 ~750 KB；`use_gpu=true`（无 GPU 自动回落 CPU），CUDA0 实测优先、缺 cuda DLL 自动落 Vulkan0。源码已 commit 到 `main`（dist/ 内 CUDA 后端产物为新改动，未 commit）。
+功能已全部可用的阶段：`whisper2txt`（C++17 + 纯 Win32 + whisper.cpp large-v3-turbo）已完成 GUI + CLI + MP3 解码 + 同名 `.txt`/`.srt` 输出 + 模型自动下载续传/镜像回退 + 取消 + 批量 + VAD 加速，并已端到端实测通过。**2026-11-04 起改为动态库分发**：`whisper.dll/ggml.dll/ggml-base.dll` + 运行时按需加载的后端 DLL（`ggml-cuda.dll` / `ggml-vulkan.dll` / 9 个 `ggml-cpu-*.dll`），一次构建同时支持 NVIDIA(CUDA 13.4) 与 AMD(Vulkan)，`whisper2txt.exe` 仅 ~800 KB；`use_gpu=true`（无 GPU 自动回落 CPU），CUDA0 实测优先、缺 cuda DLL 自动落 Vulkan0。**同日新增识别率调优套件**：音频预处理（较响声道 + 100 Hz 高通 + 峰值归一化）、`质量` 两档（fast greedy / high beam5 + 阈值与 VAD 调参）、术语表（`initial_prompt` + `错=>对` 后处理替换）、分段去重、mixed 28/30 重叠窗 + 跨窗上下文、GPU `flash_attn`，以及 A/B 评分工具（`scripts\ab_quality.ps1` + `tools\wer.py`）。**本次调优套件未 commit**（`git status` 应为 13 个 M + 3 个 ??：`src/audio.*`、`src/engine.*`、`src/main.cpp`、`src/ui.*`、5 份文档、`.gitignore`，新增 `scripts\ab_quality.ps1`、`tools\wer.py`、`test\ref_zh_long.txt`）。上一个 commit 是 `ba55db6 GPU acceleration enable`（已含动态库分发 + GPU + Allman 格式化 + `.clang-format`）。
 
 ## 接手必读顺序
 
 1. 本文件
-2. `techdesign.md` §9「已知坑清单」（8 条，全部会踩）
+2. `techdesign.md` §9「已知坑清单」（21 条，全部会踩）
 3. `progress.md` 实测数据表 + 遗留清单
 4. 需要改代码时：`src/engine.cpp`（whisper 调用细节）、`src/main.cpp`（GUI/CLI/线程/消息）
 
@@ -17,7 +17,7 @@
 
 ```
 已生成产物（动态库方案，2026-11-04，build_gpu\）：
-  dist\whisper2txt.exe          769,536 B   （链接 whisper.dll，不再内嵌后端）
+  dist\whisper2txt.exe          816,640 B   （链接 whisper.dll，不再内嵌后端）
   dist\whisper.dll / ggml.dll / ggml-base.dll
   dist\ggml-cpu-*.dll         9 个（sse42/sandybridge/haswell/alderlake/icelake/skylakex/cascadelake/cannonlake/x64）
   dist\ggml-cuda.dll          155,000,832 B（NVIDIA 发行包）
@@ -29,7 +29,9 @@
   %LOCALAPPDATA%\WhisperTxt\models\ggml-large-v3-turbo.bin   1,624,555,275 B
   %LOCALAPPDATA%\WhisperTxt\models\ggml-silero-v6.2.0.bin       885,098 B
 第三方：third_party\whisper.cpp  （git clone --depth 1 ggml-org/whisper.cpp，已被 .gitignore 忽略）
-测试：test\  （样本 wav/mp3、输出 txt/srt、out_*.log、gui_smoke.ps1；**wav/mp3 不入库**，新机器用 progress.md 里的 TTS 脚本重建 `zh_test.wav`，`jfk.wav` 可从 `third_party\whisper.cpp\samples\jfk.wav` 复制）
+测试：test\  （样本 wav/mp3、输出 txt/srt、out_*.log、gui_smoke.ps1、`ref_zh_long.txt`＝A/B 标准答案；**wav/mp3 不入库**，新机器用 progress.md 里的 TTS 脚本重建 `zh_test.wav` 与 `zh_long.wav`（45 s，mixed/重叠窗/A-B 用），`jfk.wav` 可从 `third_party\whisper.cpp\samples\jfk.wav` 复制）
+A/B 输出：ab\（每配置一份 txt + `repo\` 对照，已 .gitignore）
+自动化验证覆盖：质量下拉（CB_SETCURSEL=1 后日志出现「高精度模式下建议改用 large-v3」提示）、VAD/GPU 复选框（BM_CLICK）、GPU/CUDA 后端加载。**未自动化**：「选择术语表...」的文件对话框（其与 CLI `--terms` 共用 `load_terms_file()`，已用 CLI 验证解析/替换/提示词效果）。
 未清理：build_w\（残留，删除时被占用，可忽略/手动删）
 ```
 
@@ -54,10 +56,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File test\gui_smoke.ps1 `
 
 | 优先级 | 任务 | 说明 |
 |---|---|---|
-| 高 | 真实长 MP3 压力测试 | 找 10–60 min 真实中文 MP3，验证内存、边界质量、是否需要自动分段与 `duration_ms` 分块 |
+| 高 | **真实录音 A/B 标定** | 用用户自己的 10–60 min 真实 MP3（口音重/音质差）跑 `scripts\ab_quality.ps1`：定出预处理开/关、high/fast、是否换 large-v3、术语表内容。**当前所有调优参数只在干净 TTS 样本上验证过**，不能当结论 |
+| 高 | 真实长 MP3 压力测试 | 验证内存、边界质量、是否需要自动分段与 `duration_ms` 分块 |
 | 高 | git 首次提交 + 分阶段 commit | 用户未要求前不要 push；只 commit 本地 |
-| 中 | mixed 模式窗边界质量改进 | 现方案 30 s 无重叠切窗；可试 28/30 s 重叠 + 去重，或按 VAD 段边界切窗 |
-| 中 | VAD 参数暴露到 UI | `whisper_vad_default_params()` 的 threshold / min-speech-duration 等做 UI 微调 |
+| 中 | 预处理/术语表参数暴露到 UI | 现在 UI 只有「音频预处理」总开关 + 术语表按钮；高通 Hz、增益目标、VAD 阈值/填充只有 CLI（`--highpass` / `--vad-threshold` / `--vad-pad`） |
+| 中 | 设置持久化 | 目前每次启动回到默认值；可写 `%LOCALAPPDATA%\WhisperTxt\settings.ini`（记住模型槽、语言、质量、复选框、术语表路径） |
+| 中 | 可选降噪（谱减/RNNoise） | 默认**别开**——过度降噪会显著降识别率；实现后必须 A/B |
 | 中 | 版本信息与图标（.rc） | 便于用户识别版本；注意 rc.exe 与 CMake 集成 |
 | 低 | 崩溃日志落盘 | 把 UI 日志同时写 `%LOCALAPPDATA%\WhisperTxt\logs\` |
 | 低 | 拖放整个文件夹递归添加、`--threads` 上限按物理核校验 | 小改进 |
@@ -75,19 +79,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File test\gui_smoke.ps1 `
 
 | 位置 | 内容 |
 |---|---|
-| `src/engine.cpp:75` | `Transcriber::load()`：`ggml_backend_load_all()`（必需）+ GPU/CPU 选择（`cparams.use_gpu = cfg_.use_gpu`）+ 设备日志 |
-| `src/engine.cpp` `gpu_device_list()` | 枚举已加载后端里的 GPU 设备名（用于日志与「无 GPU 自动回落」提示） |
-| `src/engine.cpp:204` | `Transcriber::transcribe()`：非 mixed 单调用 / mixed 逐 30 s 窗循环（mixed 分支从 :252 起） |
-| `src/engine.cpp` `emit_segments` | 分段抽取 + 厘秒→ms + `window_base_ms_` 偏移 + 过滤空段/`[BLANK_AUDIO]` |
-| `src/engine.cpp` `physical_core_count()` | CPUID 判超线程 → 默认线程数 |
-| `src/main.cpp` `run_files()` | 与 UI 无关的核心批处理流程（GUI 与 CLI 共用） |
-| `src/main.cpp` `JobContext` | 解耦 UI/CLI 的 log+progress+cancel 注入结构 |
-| `src/main.cpp` `run_cli_mode()` | CLI 参数解析与 console UTF-8 输出 |
+| `src/engine.cpp:90` | `Transcriber::load()`：`ggml_backend_load_all()`（必需）+ GPU/CPU 选择（`cparams.use_gpu`、GPU 上 `flash_attn`）+ 设备日志 |
+| `src/engine.cpp:36` | `gpu_device_list()`：枚举已加载后端里的 GPU 设备名（用于日志与「无 GPU 自动回落」提示） |
+| `src/engine.cpp:254` | `Transcriber::transcribe()`：质量预设（fast greedy / high beam5 + 阈值）、`initial_prompt`、VAD 调参；非 mixed 单调用 / mixed 28/30 重叠窗循环；末尾去重 + 术语替换 |
+| `src/engine.cpp:174` | `emit_segments`：分段抽取 + 厘秒→ms + `window_base_ms_` 偏移 + mixed 所有权 horizon（`window_own_limit_ms_`）+ 过滤空段/`[BLANK_AUDIO]` |
+| `src/engine.cpp:588` / `:632` | `apply_terms()`（`错=>对` 替换，英文按词边界） / `dedupe_segments()`（归一化文本后的重复与前缀包含合并） |
+| `src/engine.cpp:58` | `physical_core_count()`：CPUID 判超线程 → 默认线程数 |
+| `src/audio.cpp:81` | `decode_audio_16k_mono(...)`：`channels=0` 保持原声道 → 声道能量统计/取较响声道 → `highpass_biquad()`(:47) → 峰值归一化；输出 `AudioStats` |
+| `src/main.cpp:164` | `ensure_transcriber_ctx()`：signature（含 quality/promptHash/termsCount/vad 调参）+ `EngineConfig` 填充 |
+| `src/main.cpp:220` | `run_files()`：与 UI 无关的核心批处理流程（GUI 与 CLI 共用），含预处理统计日志 |
+| `src/main.cpp:418` | `load_terms_file()`：术语表解析（注释、`A=>B` 替换、拼 `initial_prompt` ≤420 B） |
+| `src/main.cpp:695` | `on_select_terms()`：术语表文件对话框 + 按钮回显 + 加载计数日志 |
+| `src/main.cpp:979` | `run_cli_mode()`：CLI 参数解析与 console UTF-8 输出（`console_write()` :972） |
 | `src/main.cpp` `WM_CREATE` / `wnd_proc` | 控件初始化、`WM_APP_*` 消息处理、关闭时 cancel+join |
 | `src/downloader.cpp` `download_from_url` | Range 续传、416/206/200 分支、15 s 慢速→外层切镜像 |
 | `src/models.cpp` `kModels/kVad/init_urls` | 模型 label/文件名/URL/min_size/expected_size |
-| `src/ui.cpp` `ui_create` / `ui_layout` | 控件创建（含 id：101-104 按钮 / 201-203 下拉 / 301-304 复选 / 501 列表 / 601 进度 / 701 日志）与坐标自适应；**每个控件都必须在 `ui_layout()` 里 MoveWindow**（改界面先看这里） |
-| `CMakeLists.txt` | 构建选项集中处（OpenMP、静态 CRT、manifest、/utf-8） |
+| `src/ui.cpp` `ui_create` / `ui_layout` | 控件创建（id：101-105 按钮 / 201-204 下拉 / 301-305 复选 / 401-402 起停 / 501 列表 / 601 进度 / 701 日志）与坐标自适应；**每个控件都必须在 `ui_layout()` 里 MoveWindow**（改界面先看这里；最小窗口 880×520） |
+| `scripts/ab_quality.ps1` + `tools/wer.py` | 多配置 A/B 跑批 + 编辑距离评分（`ERROR_RATE:` 行为解析锚点） |
+| `CMakeLists.txt` | 构建选项集中处（OpenMP、静态 CRT、manifest、/utf-8、`WHISPER2TXT_SHARED`） |
 
 ## 已知环境问题（本机）
 

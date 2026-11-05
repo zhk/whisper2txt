@@ -1,0 +1,1 @@
+今天的Project会议定在下午三点，我们需要review一下这个Prototype的设计方案，确保整体的用户体验没有问题。另外，请大家把各自的Report提前发到群里，方便沟通。这个项目会使用React和Kubernetes，后端用Go语言，数据库是PostgreSQL。下周我们会做一次Code Review，请每位同事提前把PR提交上去。最后，产品经理会更新Roadmap，并把关键的Milestone同步给所有Stakeholder。如果有任何问题，请在群里随时沟通，我们每天上午十点开Standup会议。

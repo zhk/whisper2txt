@@ -54,21 +54,34 @@ PostMessage 回传进度/日志 ◀──────  ensure_transcriber_ctx �
 `src/audio.cpp` 使用 miniaudio（header-only，来自 `third_party/whisper.cpp/examples/miniaudio.h`）：
 
 ```cpp
-ma_decoder_config cfg = ma_decoder_config_init(ma_format_f32, 1, 16000);
+ma_decoder_config cfg = ma_decoder_config_init(ma_format_f32, 0, 16000);  // channels=0 → 保持原声道数
 ma_decoder_init_file(utf8_path, &cfg, &decoder);
-// 循环 ma_decoder_read_pcm_frames(8192) 直到 MA_AT_END
+ma_decoder_get_data_format(&decoder, &fmt, &channels, &rate, nullptr, 0); // 解析后的输出声道数
+// 循环 ma_decoder_read_pcm_frames(8192) 直到 MA_AT_END（交错 f32）
 ```
 
-- 解码 + 重采样 + 下混一步完成，无需 ffmpeg。
+- 解码 + 重采样一步完成，无需 ffmpeg；**不再**让 miniaudio 直接下混（`channels=0`），因为要按声道分别算能量。
+- 后处理链（`AudioPreproc`，默认开，UI 复选框 / `--no-preproc`）：
+  1. 多声道时按累计能量取**较响的那个声道**（`select_loudest_channel`；关掉则平均下混）。
+  2. **2 阶 Butterworth 高通**（RBJ 双二阶，`highpass_hz` 默认 100，CLI `--highpass N`，0=关）：去隆隆/风噪/直流偏置。
+  3. **峰值归一化**到 −1 dBFS（`0.891`），增益限幅 `[1/16, 16]`（±24 dB），增益在 ±0.2 dB 内不动作。
+- `AudioStats` 返回声道数/所选声道/前后峰值 dB/增益 dB，`run_files()` 打印一行「音频预处理: ...」便于排查。
 - 不用 `ma_decoder_get_length_in_pcm_frames` 一次分配（VBR MP3 不可靠），改为分块追加。
 - 路径先 `WideCharToMultiByte(CP_UTF8)`，支持中文文件名。
 
 ## 4. Whisper 调用要点（`src/engine.cpp`）
 
-- `whisper_context_params.use_gpu = cfg.use_gpu`（UI「使用 GPU 加速」复选框 / CLI `--gpu`|`--cpu`，默认启用；false 时 whisper 走 CPU 后端）；`flash_attn = false`。
+- `whisper_context_params.use_gpu = cfg.use_gpu`（UI「使用 GPU 加速」复选框 / CLI `--gpu`|`--cpu`，默认启用；false 时 whisper 走 CPU 后端）；`flash_attn = use_gpu && cfg.flash_attn`（GPU 上现已默认开，large 模型提速明显）。
 - 任何 whisper 调用前必须 `ggml_backend_load_all()`（`Transcriber::load()` 内 `std::call_once`），否则共享库+`GGML_BACKEND_DL` 下 registry 里没有任何后端。
 - `whisper_init_state(ctx)` 取得 `whisper_state*` 并缓存，多次转写复用同一模型（加载 ~8.5 s）。
-- `whisper_full_params`：`GREEDY`、`no_timestamps=false`（SRT 需要时间戳）、`print_*` 全 false（走回调）、`suppress_blank=true`、`suppress_nst=true`、`temperature_inc=0.2`。
+- `whisper_full_params`（两档预设，`EngineConfig::quality`）：
+  - **fast**（默认）：`WHISPER_SAMPLING_GREEDY` + `greedy.best_of=1`、`temperature_inc=0.2`，其余用库默认。
+  - **high**：`WHISPER_SAMPLING_BEAM_SEARCH` + `beam_search.beam_size=5`、`temperature_inc=0.4`、`entropy_thold=1.5`、`logprob_thold=−1.2`、`no_speech_thold=−0.6`；VAD 同时调成 `threshold 0.35 / speech_pad_ms 150 / min_silence_duration_ms 300 / max_speech_duration_s 40`。
+  - 共同：`no_timestamps=false`（SRT 要时间戳）、`print_*` 全 false（走回调）、`suppress_blank=true`、`suppress_nst=true`、`no_context=false`（同一次调用内保留上文）。
+  - 注意本版本 whisper.cpp 的默认值是 `no_context=true`、`no_speech_thold=0.6`、`greedy.best_of=5`、`beam_search.beam_size=-1` —— 改参数前先看 `whisper_full_default_params()`，别按旧文档写死。
+- `params.initial_prompt`：术语表拼接（≤420 B）。实测会同时影响**大小写**（`Review`→`review`）、**标点密度**（逗号变多）和**分段粒度**，所以调完必须重新 A/B。
+- `params.vad_params`：由质量预设填默认，再被 `VadTuning` 覆盖（CLI `--vad-threshold` / `--vad-pad`；`-1` 表示不覆盖）。
+- 后处理（`transcribe()` 末尾）：`dedupe_segments()`（归一化文本后：完全相同 → 合并时间；时间重叠 >300 ms 且互为前缀 → 取更长者）→ `apply_terms()`（`术语表` 里 `错=>对` 的替换，英文按单词边界、大小写无关，非 ASCII 按字节子串）。
 - 时间戳单位：`whisper_full_get_segment_t0/t1` 返回 **厘秒**（1/100 s），×10 得 ms。
 
 ### 语言模式实现
@@ -77,7 +90,9 @@ ma_decoder_init_file(utf8_path, &cfg, &decoder);
 |---|---|
 | 中文 / 英文 | `params.language = "zh" / "en"`，一次 `whisper_full_with_state` 处理整段（whisper 内部滑窗并保留上下文，质量最好） |
 | 自动检测 | `params.language = nullptr`，whisper 在开头检测一次并固定该语言 |
-| 中英混合 | 按 **30 秒窗** 切分，每窗调用 `whisper_full_with_state(..., language=nullptr)`。因为每次调用传入的只是该窗样本，whisper 的内部 auto-detect 正好检测该窗的语言 |
+| 中英混合 | 按 **28/30 秒重叠窗**（hop 28 s、win 30 s）切分，每窗调用 `whisper_full_with_state(..., language=nullptr)`。因为每次调用传入的只是该窗样本，whisper 的内部 auto-detect 正好检测该窗的语言 |
+
+**mixed 窗去重（重叠窗）**：每窗只接受 `t0 − window_base_ms_ < window_own_limit_ms_` 的分段（`window_own_limit_ms_ = min(29000, 窗长)`，见 `emit_segments()`），落在尾部 2 s 内的段交给下一窗（下一窗看得到它且右上下文更好）；窗尾重复再靠 `dedupe_segments()` 兜底。每窗还把上一窗尾部 ≤480 B 文本 + 术语表拼成 `params.initial_prompt` 传进去，补回跨窗丢失的上下文（截断时按 UTF-8 前导字节对齐，别从中间切）。
 
 **踩坑（重要）**：不要把 `params.detect_language = true` 用于转写 —— 该标志会让 `whisper_full_with_state` 只检测语言然后 `return 0`（不产生任何文本）。逐窗检测必须靠"每窗独立调用 + language=nullptr"实现。
 
@@ -105,18 +120,21 @@ WinHTTP 实现（不依赖 curl 外部进程）：
 
 ## 7. GUI（`src/ui.cpp`, `src/main.cpp`）
 
-- 纯 `CreateWindowExW` 控件：ListBox（多选、`LBS_EXTENDEDSEL`）、3 个 ComboBox、4 个 Checkbox（同时生成 .srt / 覆盖已有输出 / 启用 VAD 加速 / 使用 GPU 加速）、进度条 `msctls_progress32`、只读 multiline Edit 日志。
-- 字体 `Microsoft YaHei UI`，`CLEARTYPE_QUALITY`；`WM_SIZE → ui_layout()` 自适应重排（三个 `STATIC` 标签 模型/语言/线程 与各自 ComboBox 同列对齐，ComboBox 宽度随窗口收缩，最小宽度 780 下无重叠）。
-- `DragAcceptFiles` + `WM_DROPFILES`（只接受 mp3/wav/flac）；`GetOpenFileNameW` + `OFN_ALLOWMULTISELECT|OFN_EXPLORER`（解析 `dir\0f1\0f2\0\0`）。
-- `IsDialogMessageW` 提供 Tab 导航；`WM_GETMINMAXINFO` 限制最小 780×520。
+- 纯 `CreateWindowExW` 控件：ListBox（多选、`LBS_EXTENDEDSEL`）、4 个 ComboBox（模型 / 语言 / 线程 / 质量）、5 个 Checkbox（同时生成 .srt / 覆盖已有输出 / 启用 VAD 加速 / 使用 GPU 加速 / 音频预处理）、5 个 Button（添加 / 移除 / 清空 / 打开输出目录 / 选择术语表）、进度条 `msctls_progress32`、只读 multiline Edit 日志。
+- 字体 `Microsoft YaHei UI`，`CLEARTYPE_QUALITY`；`WM_SIZE → ui_layout()` 自适应重排（4 个 `STATIC` 标签 模型/语言/线程/质量 与各自 ComboBox 同列对齐；模型下拉宽度随窗口伸缩 `[150,340]`，语言 180 / 线程 80 / 质量 130 固定；「选择术语表」按钮固定在右列 chk_srt 下方）。
+- `DragAcceptFiles` + `WM_DROPFILES`（只接受 mp3/wav/flac）；`GetOpenFileNameW` + `OFN_ALLOWMULTISELECT|OFN_EXPLORER`（解析 `dir\0f1\0f2\0\0`）；术语表单选对话框见 `on_select_terms()`。
+- `IsDialogMessageW` 提供 Tab 导航；`WM_GETMINMAXINFO` 限制最小 **880×520**（4 个下拉 + 2 排复选框需要这个宽度才不重叠）。
 - 关闭：`WM_CLOSE/WM_DESTROY` → `stop=true, cancel=true` → 轮询 `running` 最多 30 s → `join()`。
 - CLI/GUI 分流：`CommandLineToArgvW`；有参数 → CLI（`--cli` 可显式）；`--gui 文件...` → GUI 预填文件列表。
-- CLI 选项与 UI 一一对应：`--model` / `--lang` / `--threads` / `--no-srt` / `--vad` / `--overwrite` / `--gpu`（默认）/ `--cpu`。`use_gpu` 参与 transcriber 的 signature（切换会重载模型）。
+- CLI 选项与 UI 一一对应：`--model` / `--lang` / `--threads` / `--no-srt` / `--vad` / `--overwrite` / `--gpu`（默认）/ `--cpu` / `--quality fast|high` / `--terms 文件` / `--no-preproc` / `--highpass N` / `--vad-threshold F` / `--vad-pad N`。transcriber signature 含 `model|lang|threads|vad|use_gpu|quality|promptHash|termsCount|vadThreshold|vadPad`（切换这些会重载模型；预处理只影响音频，不参与 signature）。
+- 术语表解析：`load_terms_file()`（`src/main.cpp:418`）读 UTF-8（跳 BOM），`#`/`;` 注释，`A=>B` → 后处理替换，其余行拼 `initial_prompt`（≤420 B）；结果存 `App::terms_prompt / terms_repl`，按钮文案回显文件名。
 - CLI 输出编码：`console_write()` 手写 UTF-8 字节 + `SetConsoleOutputCP(CP_UTF8)`；若 stdout 已重定向到文件则跳过 `AttachConsole`/`freopen("CONOUT$")`，否则日志文件会拿到乱码。
 
 ## 8. 已验证 / 未验证
 
 已验证：MP3 与 WAV 解码、turbo 中文与中英混合准确性、mixed 逐窗检测、VAD 加速与自动下载、断点续传与镜像回退、取消与批量队列、GUI 自动化点击端到端、静态 CRT 无 VC 运行库依赖。GPU：CUDA0（RTX 5070 Ti）46× 实时、Vulkan0 回落（改名掉 ggml-cuda.dll）结果一致、CPU 模式 1.75× 实时；缺 GPU 后端 DLL 时日志提示并自动用 CPU。
+
+识别率相关（2026-11-04 新增，均已实测）：音频预处理（声道选择 + 100 Hz 高通 + 峰值归一化）与日志统计；`--quality high`（beam5 + 阈值/ VAD 调参）在 GPU 上 38–47× 实时仍远超实时；术语表 `initial_prompt` 与 `错=>对` 后处理替换均生效（`购语言`→`Go 语言`、`CodeReview`→`Code Review`、`Prototype=>原型`）；mixed 改 28/30 重叠窗后 45 s 样本无重复段、结尾不漏；`flash_attn=true`（GPU）后 fast 档 58.8× 实时；`scripts\ab_quality.ps1` + `tools\wer.py` 出错误率（45 s 样本：fast/high/high+VAD 3.27% → 加术语表 **1.31%**）。
 
 未做/待办见 `HANDOFF.md`。
 
@@ -139,6 +157,10 @@ WinHTTP 实现（不依赖 curl 外部进程）：
 15. 共享库模式下 whisper/ggml DLL 落在 `build*/bin/Release/`，exe 在 `build*/Release/`，**直接跑 build 目录里的 exe 会因为找不到 whisper.dll 而失败** → 一律跑 `dist\whisper2txt.exe`（build.ps1 已把两者汇总到 dist）。
 16. `STATIC` 标签没有自动布局：`ui_create` 里创建的 `模型:/语言:/线程:` 若不在 `ui_layout()` 里 `MoveWindow`，会留在初始 `(0,0,10,20)` 压在列表框上（曾如此）。新增控件时务必存 HWND 并在 `ui_layout()` 定位；可用 `EnumChildWindows`+`GetWindowRect`/`ScreenToClient` 脚本核对坐标与重叠（临时脚本，不入库）。
 17. 若有 `dist\whisper2txt.exe` 进程在跑，`build.ps1` 删 dist 会 `Access to the path is denied`（DLL 被占用）→ build.ps1 现在先结束 Path 位于 dist 下的 whisper2txt 进程再删。
+18. **音频预处理会改变 whisper 的行为**：同一 TTS 样本加归一化+高通后分段数 6→13、`三点`→`3点`（错误率不变）。所以任何预处理改动都要用 `scripts\ab_quality.ps1` 在**真实录音**上 A/B，别凭直觉开/关；预处理也不参与 transcriber signature（只改音频，不需要重载模型）。
+19. **`initial_prompt` 不只是“加词”**：它会改标点密度、大小写与分段粒度（实测 `Review`→`review`、逗号变多、段更少更长）。术语表换一版就得重跑 A/B。
+20. **PowerShell 5.1 按 ANSI 读 .ps1**：脚本里写中文字面量会解析报 `Missing type name after '['` 之类乱码错。`scripts\*.ps1`、`test\gui_smoke.ps1` 保持 **ASCII**（要中文请用 `[char]0xXXXX` 或从文件读），或存 UTF-8 with BOM。`tools\wer.py` 因此只输出 ASCII 关键字 `ERROR_RATE:` 供 ps1 正则取用。
+21. mixed 重叠窗的**所有权 horizon（29 s）**是启发式：被丢弃的尾部段依赖下一窗重新识别，边界仍可能出现“上一段尾被切掉”的情况；`dedupe_segments()` 只能处理文本前缀包含关系，处理不了完全错乱的重复。调 `own_horizon`/`hop` 后必须重跑长样本核对（`test\zh_long.wav`）。
 
 ## 10. 代码风格
 
