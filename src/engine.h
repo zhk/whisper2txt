@@ -53,6 +53,7 @@ struct EngineConfig
     std::vector<std::pair<std::string, std::string>> terms;
     VadTuning vad_tuning;
     float no_speech_thold = -100.0f;
+    std::string suppress_regex;
 };
 
 class Transcriber

@@ -63,7 +63,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File test\gui_smoke.ps1 `
 | 中 | 预处理/术语表参数暴露到 UI | 现在 UI 只有「音频预处理」总开关（高通固定 100 Hz，见 `read_settings`）+ 术语表按钮；高通 Hz、增益目标、VAD 阈值/填充、`--no-speech-thold` 只有 CLI |
 | 中 | 设置持久化 | 目前每次启动回到默认值；可写 `%LOCALAPPDATA%\WhisperTxt\settings.ini`（记住模型槽、语言、质量、复选框、术语表路径） |
 | 中 | 可选降噪（谱减/RNNoise） | 默认**别开**——过度降噪会显著降识别率；实现后必须 A/B |
-| 中 | 版本信息与图标（.rc） | 便于用户识别版本；注意 rc.exe 与 CMake 集成 |
+| 中 | 版本信息（VERSIONINFO 资源） | 便于用户识别版本；图标已做（`src/app.rc` + `src/app.ico`，生成脚本 `scripts\gen_icon.ps1`），还缺版本号 |
 | 低 | 崩溃日志落盘 | 把 UI 日志同时写 `%LOCALAPPDATA%\WhisperTxt\logs\` |
 | 低 | 拖放整个文件夹递归添加、`--threads` 上限按物理核校验 | 小改进 |
 
@@ -87,7 +87,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File test\gui_smoke.ps1 `
 | `src/engine.cpp:716` / `:760` | `apply_terms()`（`错=>对` 替换，英文按词边界） / `dedupe_segments()`（归一化文本后的重复与前缀包含合并） |
 | `src/engine.cpp:803` / `:837` | `make_vad_params()`（预设 + `VadTuning` 覆盖） / `vad_chunks()`（`whisper_vad_segments_from_samples` 的**厘秒**×10 → 合并 ≤28 s 块、间隔 ≤1 s；打日志「VAD 原始语音段: N 段 -> 合并为 M 块」） |
 | `src/engine.cpp:58` | `physical_core_count()`：CPUID 判超线程 → 默认线程数 |
-| `src/audio.cpp:81` | `decode_audio_16k_mono(...)`：`channels=0` 保持原声道 → 声道能量统计/取较响声道 → `highpass_biquad()`(:47) → 峰值归一化；输出 `AudioStats` |
+| `src/audio.cpp:81` | `decode_audio_16k_mono(...)`：`channels=0` 保持原声道 → 声道能量统计/取较响声道 → `highpass_biquad()`(:47) → RMS 响度归一化（目标 −20 dBFS，极弱音回退峰值归一化）+ 峰值限幅；输出 `AudioStats`（含 rms 前后/是否 loudnorm） |
 | `src/main.cpp:164` | `ensure_transcriber_ctx()`：signature（含 quality/promptHash/termsCount/vad 调参）+ `EngineConfig` 填充 |
 | `src/main.cpp:220` | `run_files()`：与 UI 无关的核心批处理流程（GUI 与 CLI 共用），含预处理统计日志 |
 | `src/main.cpp:418` | `load_terms_file()`：术语表解析（注释、`A=>B` 替换、拼 `initial_prompt` ≤420 B） |

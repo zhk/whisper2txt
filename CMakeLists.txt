@@ -27,6 +27,7 @@ add_executable(whisper2txt WIN32
     src/output.cpp
     src/downloader.cpp
     src/models.cpp
+    src/app.rc
 )
 
 target_include_directories(whisper2txt PRIVATE

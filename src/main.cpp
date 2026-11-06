@@ -22,6 +22,7 @@
 #include "engine.h"
 #include "models.h"
 #include "output.h"
+#include "resource.h"
 #include "ui.h"
 #include "util.h"
 
@@ -69,10 +70,12 @@ struct Settings
     bool use_gpu = true;
     int quality = 1;
     bool preproc = true;
+    bool loudnorm = true;
     int highpass_hz = 100;
     float vad_threshold = -1.0f;
     int vad_pad_ms = -1;
     float no_speech_thold = -100.0f;
+    std::string suppress_regex;
     std::string terms_prompt;
     std::vector<std::pair<std::string, std::string>> terms_repl;
     std::vector<std::wstring> files;
@@ -170,7 +173,8 @@ static bool ensure_transcriber_ctx(JobContext &ctx, Settings &st, std::wstring &
                                   std::to_string(st.use_gpu ? 1 : 0) + "|" + std::to_string(st.quality) + "|" +
                                   std::to_string(prompt_h) + "|" + std::to_string(st.terms_repl.size()) + "|" +
                                   std::to_string((int)(st.vad_threshold * 100.0f)) + "|" + std::to_string(st.vad_pad_ms) +
-                                  "|" + std::to_string((int)(st.no_speech_thold * 100.0f));
+                                  "|" + std::to_string((int)(st.no_speech_thold * 100.0f)) + "|" +
+                                  std::to_string(std::hash<std::string>{}(st.suppress_regex));
 
     if (*ctx.transcriber != nullptr && *ctx.signature == signature)
     {
@@ -191,6 +195,7 @@ static bool ensure_transcriber_ctx(JobContext &ctx, Settings &st, std::wstring &
     cfg.vad_tuning.threshold = st.vad_threshold;
     cfg.vad_tuning.speech_pad_ms = st.vad_pad_ms;
     cfg.no_speech_thold = st.no_speech_thold;
+    cfg.suppress_regex = st.suppress_regex;
     if (st.quality == 1 && st.model_slot == SLOT_TURBO)
     {
         ctx.log(L"提示: 高精度模式下建议改用 large-v3 模型 (对口音与音质的鲁棒性更好)");
@@ -285,6 +290,7 @@ static bool run_files(JobContext &ctx, Settings st, std::wstring &job_message)
             AudioPreproc pp;
             pp.select_loudest_channel = st.preproc;
             pp.normalize = st.preproc;
+            pp.loudnorm = st.preproc && st.loudnorm;
             pp.highpass_hz = st.preproc ? st.highpass_hz : 0;
             AudioStats stats;
             if (!decode_audio_16k_mono(file, samples, pp, stats, err))
@@ -295,10 +301,12 @@ static bool run_files(JobContext &ctx, Settings st, std::wstring &job_message)
             }
             if (stats.channels > 1 || stats.normalized || stats.highpassed)
             {
-                wchar_t buf[160];
-                swprintf(buf, 160, L"音频预处理: 声道 %d 取 ch%d, 峰值 %.1f -> %.1f dBFS, 增益 %+.1f dB%s", stats.channels,
-                    stats.picked_channel, stats.peak_before_db, stats.peak_after_db, stats.gain_db,
-                    stats.highpassed ? L", 高通滤波" : L"");
+                const wchar_t *loud = stats.loudnormed ? L" (RMS)" : L"";
+                wchar_t buf[192];
+                swprintf(buf, 192,
+                    L"音频预处理: 声道 %d 取 ch%d, RMS %.1f -> %.1f dBFS, 峰值 %.1f -> %.1f dBFS, 增益 %+.1f dB%s%s", stats.channels,
+                    stats.picked_channel, stats.rms_before_db, stats.rms_after_db, stats.peak_before_db, stats.peak_after_db,
+                    stats.gain_db, loud, stats.highpassed ? L", 高通滤波" : L"");
                 ctx.log(buf);
             }
 
@@ -1111,6 +1119,11 @@ static int run_cli_mode()
             st.preproc = false;
             continue;
         }
+        if (a == L"--no-loudnorm")
+        {
+            st.loudnorm = false;
+            continue;
+        }
         if (a == L"--highpass" && i + 1 < argc)
         {
             ++i;
@@ -1135,6 +1148,12 @@ static int run_cli_mode()
             st.no_speech_thold = (float)_wtof(argv[i]);
             continue;
         }
+        if (a == L"--suppress-regex" && i + 1 < argc)
+        {
+            ++i;
+            st.suppress_regex = u8(argv[i]);
+            continue;
+        }
         if (!a.empty() && a[0] == L'-')
         {
             console_write(L"未知选项: " + a + L"\n");
@@ -1150,11 +1169,13 @@ static int run_cli_mode()
         console_write(L"  --lang zh|en|auto|mixed      默认 zh (mixed = 28/30 秒重叠窗逐窗检测语言)\n");
         console_write(L"  --quality fast|high          默认 high (beam5 + 更严的回退阈值 + VAD 调参); 要快用 fast\n");
         console_write(L"  --terms 术语表.txt           每行一个术语(喂给解码器作提示); “错=>对” 为后处理替换\n");
-        console_write(L"  --no-preproc                 关闭音频预处理 (默认开: 取较响声道 + 峰值归一化 + 100Hz 高通)\n");
+        console_write(L"  --no-preproc                 关闭音频预处理 (默认开: 取较响声道 + RMS 响度归一化 + 100Hz 高通)\n");
+        console_write(L"  --no-loudnorm                仅用峰值归一化而非 RMS 响度归一化 (低音量录音建议保留 RMS)\n");
         console_write(L"  --highpass N                 高通截止 Hz (默认 100, 0 = 关闭)\n");
         console_write(L"  --vad / --no-vad             VAD 按语音段切窗、静音不送识别 (默认开)\n");
         console_write(L"  --vad-threshold F --vad-pad N  VAD 阈值/前后填充 (默认由质量模式决定)\n");
         console_write(L"  --no-speech-thold F          静音判定概率阈值 (默认 0.6; 调低更容易把低置信窗判为静音而丢弃)\n");
+        console_write(L"  --suppress-regex <regex>     抑制匹配的 token (如: [\\u3000-\\u303f] 抑制 CJK 标点幻觉)\n");
         console_write(L"  --threads N   --no-srt   --overwrite   --gpu (默认) | --cpu\n");
         console_write(L"输出: 与输入同目录同名的 .txt (和 .srt)\n");
         return 2;
@@ -1227,6 +1248,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show)
 
     App app;
 
+    HICON icon_big = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APPICON));
+    if (icon_big == nullptr)
+    {
+        icon_big = LoadIconW(nullptr, IDI_APPLICATION);
+    }
+    HICON icon_small = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+    if (icon_small == nullptr)
+    {
+        icon_small = icon_big;
+    }
+
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1235,7 +1268,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show)
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = L"WhisperTxtWindow";
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIcon = icon_big;
+    wc.hIconSm = icon_small;
     RegisterClassExW(&wc);
 
     const int width = 900;

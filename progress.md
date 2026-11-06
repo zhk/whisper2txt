@@ -107,6 +107,13 @@ A/B 错误率（`scripts\ab_quality.ps1`，标准答案 `test\ref_zh_long.txt`�
 
 预处理观察：同一 TTS 样本开启预处理后分段 6→13、`三点`→`3点`，错误率不变 —— 说明预处理会改变 whisper 的分段/书写选择，必须实测而非臆断。
 
+### 程序图标（2026-11-06）
+
+- 图标图样当前取仓库根 `speechtotext2.png`（512×512、白底**不透明**，主色 #D9F2F2 / #4D4D4D / #F3A766）；`scripts\gen_icon.ps1`（默认 `-Source speechtotext2.png`）生成 `src/app.ico`：16/24/32/48/64/128/256 七档 PNG 压缩帧，整文件 33 KB（`-Source` / `-Out` / `-Sizes` 可重跑）。首版用的是 `speechtotext.png`（700×700 透明底，12 KB），已被替换，旧图仍留在仓库根。
+- `src/app.rc` + `src/resource.h`（`IDI_APPICON = 101`）作为 `add_executable` 的额外源文件编进 exe；`.rc` 里 `ICON "app.ico"` 能解析是因为 `target_include_directories(... src)` 把 `src` 传给了 rc.exe（techdesign §9 #24）。`main.cpp` 用 `LoadIconW(instance, MAKEINTRESOURCEW(IDI_APPICON))` 设 `wc.hIcon`、`LoadImageW(..., SM_CXSMICON/CYSMICON)` 设 `wc.hIconSm`，取不到才回落 `IDI_APPLICATION`。
+- 脚本不做抠图：新图白底不透明 → 图标是实心方块（无透明边角）。要透明得先在外部把白底抠掉，或给 `gen_icon.ps1` 加去背步骤。
+- 验证（换图后重跑）：exe 861 KB，内嵌 `RT_GROUP_ICON` #101 有 7 帧（16/24/32/48/64/128/256，PNG 压缩）；`LoadImageW` 在 16/24/32/40/48/64/256 全部成功（PNG 帧可缩放）；`scripts\build.ps1 -Gpu -Vk` 全绿、CLI 中文样本正常输出、GUI 自动化 `CLICKED_START` + `OUTPUT_CREATED`（3 s）。
+
 ## 决策记录
 
 - **不用 Python/faster-whisper/PyInstaller**：避免 150–400 MB exe、冷启动、ffmpeg 依赖。
@@ -125,7 +132,7 @@ A/B 错误率（`scripts\ab_quality.ps1`，标准答案 `test\ref_zh_long.txt`�
 - **真实录音上的调优标定**（当前调优参数只在干净 TTS 样本上验证）：用 `scripts\ab_quality.ps1` + 人工标准答案，定出预处理开关、fast/high、是否换 large-v3、术语表内容。
 - 混合语音的窗边界丢词观察（重叠窗已实现，但 45 s 样本上未覆盖“切在词中间”的极端情况）。
 - 未做：词级时间戳、说话人分离、翻译任务（turbo 不支持 translate）、可选降噪、UI 上的预处理/术语表细参数（高通 Hz、VAD 阈值）、设置持久化。
-- 未做：安装器/图标/版本信息资源（`.rc`），当前无版本号。
+- 未做：安装器、版本信息资源（VERSIONINFO，当前无版本号）。图标已完成（`src/app.rc` / `src/app.ico` / `scripts\gen_icon.ps1`）。
 - 未做：崩溃/异常日志落盘（目前仅 UI 日志区）。
 - `build_w/` 残留目录删除时被进程占用，可稍后手动删（已被 .gitignore 忽略）。
 

@@ -200,52 +200,101 @@ bool decode_audio_16k_mono(const std::wstring &path, std::vector<float> &out, co
         stats.highpassed = true;
     }
 
+    stats.rms_before_db = rms_db(out.data(), out.size());
     stats.peak_before_db = peak_db(out);
 
     if (pp.normalize)
     {
-        const double target = 0.891;
-        double peak = 0.0;
-        for (float f : out)
+        double gain = 1.0;
+        bool applied = false;
+        bool rms_based = false;
+
+        if (pp.loudnorm && stats.rms_before_db > -60.0)
         {
-            const double a = std::fabs((double)f);
-            if (a > peak)
+            const double target_rms = 0.1;
+            double rms = 0.0;
+            for (float f : out)
             {
-                peak = a;
+                rms += (double)f * (double)f;
+            }
+            rms = std::sqrt(rms / (double)out.size());
+            if (rms > 1e-6)
+            {
+                gain = target_rms / rms;
+                if (gain > 16.0)
+                {
+                    gain = 16.0;
+                }
+                else if (gain < 0.0625)
+                {
+                    gain = 0.0625;
+                }
+                rms_based = true;
+                applied = true;
             }
         }
-        if (peak > 1e-6)
+
+        if (!rms_based)
         {
-            double gain = target / peak;
-            if (gain > 16.0)
+            double peak = 0.0;
+            for (float f : out)
             {
-                gain = 16.0;
+                const double a = std::fabs((double)f);
+                if (a > peak)
+                    peak = a;
             }
-            else if (gain < 0.0625)
+            if (peak > 1e-6)
             {
-                gain = 0.0625;
-            }
-            if (gain < 0.98 || gain > 1.02)
-            {
-                for (float &f : out)
+                gain = 0.891 / peak;
+                if (gain > 16.0)
                 {
-                    float v = (float)((double)f * gain);
-                    if (v > 1.0f)
-                    {
-                        v = 1.0f;
-                    }
-                    else if (v < -1.0f)
-                    {
-                        v = -1.0f;
-                    }
-                    f = v;
+                    gain = 16.0;
                 }
-                stats.normalized = true;
-                stats.gain_db = 20.0 * std::log10(gain);
+                else if (gain < 0.0625)
+                {
+                    gain = 0.0625;
+                }
+                applied = true;
             }
+        }
+
+        if (applied && (gain < 0.98 || gain > 1.02))
+        {
+            for (float &f : out)
+            {
+                double v = (double)f * gain;
+                if (v > 1.0)
+                    v = 1.0;
+                else if (v < -1.0)
+                    v = -1.0;
+                f = (float)v;
+            }
+            if (rms_based)
+            {
+                double peak_after = 0.0;
+                for (float f : out)
+                {
+                    const double a = std::fabs((double)f);
+                    if (a > peak_after)
+                        peak_after = a;
+                }
+                if (peak_after > 0.98)
+                {
+                    const double limiter_gain = 0.98 / peak_after;
+                    for (float &f : out)
+                    {
+                        f = (float)((double)f * limiter_gain);
+                    }
+                    gain *= limiter_gain;
+                }
+            }
+            stats.normalized = true;
+            stats.loudnormed = rms_based;
+            stats.gain_db = 20.0 * std::log10(gain);
         }
     }
 
+    stats.rms_after_db = rms_db(out.data(), out.size());
     stats.peak_after_db = peak_db(out);
 
     return true;

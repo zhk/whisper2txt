@@ -8,6 +8,7 @@ struct AudioPreproc
 {
     bool select_loudest_channel = true;
     bool normalize = true;
+    bool loudnorm = true;
     int highpass_hz = 0;
 };
 
@@ -15,10 +16,13 @@ struct AudioStats
 {
     int channels = 1;
     int picked_channel = 0;
+    double rms_before_db = -120.0;
+    double rms_after_db = -120.0;
     double peak_before_db = 0.0;
     double peak_after_db = 0.0;
     double gain_db = 0.0;
     bool normalized = false;
+    bool loudnormed = false;
     bool highpassed = false;
 };
 

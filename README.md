@@ -131,7 +131,7 @@ GPU（RTX 5070 Ti 16 GB + CUDA 13.4）：
 ## 关键约束
 
 - **必须开启 OpenMP**（`GGML_OPENMP=ON`）。关掉后 whisper 退化到极低并行度：同一中文样本从 10.6 s 变成 298.5 s（28× 慢）。因此 `vcomp140.dll` 必须随 exe 分发。
-- 无 ffmpeg：MP3 由内置 miniaudio 解码（`third_party/whisper.cpp/examples/miniaudio.h`，调用见 `src/audio.cpp:81`），解码同时做多声道选择、高通与峰值归一化。
+- 无 ffmpeg：MP3 由内置 miniaudio 解码（`third_party/whisper.cpp/examples/miniaudio.h`，调用见 `src/audio.cpp:81`），解码同时做多声道选择、高通与 RMS 响度归一化。
 - GPU 已启用（CUDA + Vulkan，运行时自动选，无 GPU 自动回落 CPU）。构建/运行不需要 Python；`tools/wer.py`、`scripts/ab_quality.ps1` 只在做识别率 A/B 评分时用到 Python。
 
 ## 仓库结构
@@ -143,13 +143,18 @@ scripts/build.ps1       构建 + 打包到 dist\
 src/main.cpp            WinMain、GUI/CLI 分流、任务线程、消息协议
 src/ui.cpp|ui.h         纯 Win32 控件与布局、拖放
 src/engine.cpp|engine.h whisper 模型加载、转写、进度/分段回调、取消、逐窗语言检测、质量预设、术语替换/去重
-src/audio.cpp|audio.h   miniaudio 解码 → 16 kHz 单声道 float32 + 声道选择/高通/峰值归一化
+src/audio.cpp|audio.h   miniaudio 解码 → 16 kHz 单声道 float32 + 声道选择/高通/RMS 响度归一化
 src/output.cpp|output.h 写 .txt / .srt（UTF-8 BOM）
 src/downloader.cpp      WinHTTP 下载、断点续传、镜像回退、慢速切换
 src/models.cpp|models.h 模型元数据与缓存目录
+src/app.rc|resource.h   程序图标资源（RT_GROUP_ICON，IDI_APPICON=101）
+src/app.ico             编译进 exe 的图标（16/24/32/48/64/128/256 px，PNG 压缩帧）
+speechtotext2.png       当前图标原图（512×512，白底不透明）→ 由 scripts/gen_icon.ps1 转成 src/app.ico
+speechtotext.png        旧图标原图（700×700，透明背景，已不用）
 src/app.manifest        asInvoker + PerMonitorV2 DPI + Common Controls v6
 scripts/setup.ps1       clone whisper.cpp
 scripts/build.ps1       构建（-Gpu / -Vk / -Static），产物汇总到 dist\
+scripts/gen_icon.ps1    重新生成 src/app.ico（改图标后用 -Source/-Out/-Sizes）
 scripts/ab_quality.ps1  多配置 A/B 跑批（可选调用 tools/wer.py 给错误率）
 tools/wer.py            参考答案 vs 转写结果的编辑距离（中文按字 CER / 英文按词 WER）
 test/                   测试样本、日志、gui_smoke.ps1（UI 自动化）、ref_zh_long.txt（A/B 标准答案）

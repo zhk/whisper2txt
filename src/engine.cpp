@@ -314,15 +314,16 @@ bool Transcriber::transcribe(const std::vector<float> &samples, std::vector<Segm
     params.suppress_nst = true;
     params.token_timestamps = false;
     params.max_len = 0;
-    params.temperature_inc = high_quality ? 0.4f : 0.2f;
-    if (high_quality)
-    {
-        params.entropy_thold = 1.5f;
-        params.logprob_thold = -1.2f;
-    }
+    params.temperature_inc = 0.4f;
+    params.entropy_thold = 1.5f;
+    params.logprob_thold = -1.2f;
     if (cfg_.no_speech_thold > -50.0f)
     {
         params.no_speech_thold = cfg_.no_speech_thold;
+    }
+    if (!cfg_.suppress_regex.empty())
+    {
+        params.suppress_regex = cfg_.suppress_regex.c_str();
     }
     params.new_segment_callback = &Transcriber::on_new_segment;
     params.new_segment_callback_user_data = this;
@@ -334,6 +335,7 @@ bool Transcriber::transcribe(const std::vector<float> &samples, std::vector<Segm
     if (!cfg_.initial_prompt.empty())
     {
         params.initial_prompt = cfg_.initial_prompt.c_str();
+        params.carry_initial_prompt = true;
     }
 
     const whisper_vad_params vp = make_vad_params(high_quality);
@@ -395,6 +397,7 @@ bool Transcriber::transcribe(const std::vector<float> &samples, std::vector<Segm
             window_prompt_ = window_prompt_.substr(cut);
         }
         params.initial_prompt = window_prompt_.empty() ? nullptr : window_prompt_.c_str();
+        params.carry_initial_prompt = !window_prompt_.empty();
     };
 
     if (vctx_ != nullptr)
